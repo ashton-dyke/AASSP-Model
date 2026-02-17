@@ -16,6 +16,7 @@ pub mod neuron;
 pub mod overlap;
 pub mod physics;
 pub mod topology;
+pub mod training;
 
 // Re-export primary types for convenience.
 pub use adaptation::{AdapterLayer, ProductionMesh, ReplayBuffer};

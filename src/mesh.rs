@@ -36,7 +36,7 @@ pub struct OverlappingMesh {
 
     /// Seeded RNG for reproducible stochastic firing.
     #[serde(skip)]
-    rng: Option<StdRng>,
+    pub rng: Option<StdRng>,
 }
 
 impl OverlappingMesh {
@@ -117,7 +117,7 @@ impl OverlappingMesh {
     }
 
     /// Merge all proposed updates into the neuron state.
-    fn merge_updates(&mut self, updates: &[(CircuitId, Vec<(usize, f32)>)]) {
+    pub fn merge_updates(&mut self, updates: &[(CircuitId, Vec<(usize, f32)>)]) {
         // Build map: neuron_index → Vec<(circuit_id, delta)>
         let mut neuron_updates: Vec<Vec<(CircuitId, f32)>> = vec![Vec::new(); self.neurons.len()];
 
