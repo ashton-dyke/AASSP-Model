@@ -414,6 +414,50 @@ fn run_stage3(
     }
 }
 
+/// Evaluate per-circuit detection accuracy on a dataset subset.
+///
+/// For each sample, runs the mesh forward and checks whether each detection
+/// circuit's readout correctly classifies the anomaly. Returns the fraction
+/// of correct per-circuit predictions.
+pub fn evaluate_detection_accuracy(
+    mesh: &mut OverlappingMesh,
+    dataset: &[TrainingSequence],
+    baselines: &Baselines,
+    mesh_steps: u32,
+    max_samples: usize,
+) -> f32 {
+    let mut correct = 0u32;
+    let mut total = 0u32;
+    let mut count = 0;
+
+    for seq in dataset {
+        for (sample_idx, wits) in seq.wits_samples.iter().enumerate() {
+            if count >= max_samples {
+                break;
+            }
+
+            encode_input(mesh, wits, baselines);
+            for _ in 0..mesh_steps {
+                mesh.step();
+            }
+
+            let det_labels = detection_labels_for_sample(seq, sample_idx);
+            for &(circuit_idx, y_true) in &det_labels {
+                if circuit_idx < mesh.circuits.len() {
+                    let y_pred = loss::detection_readout(mesh, circuit_idx);
+                    if (y_pred > 0.5) == (y_true > 0.5) {
+                        correct += 1;
+                    }
+                    total += 1;
+                }
+            }
+            count += 1;
+        }
+    }
+
+    if total == 0 { 0.0 } else { correct as f32 / total as f32 }
+}
+
 /// Post-training: prune masks, freeze circuits, validate.
 fn post_training_freeze(mesh: &mut OverlappingMesh, prune_threshold: f32) {
     // Prune overlap neurons with mask < threshold.
@@ -485,6 +529,10 @@ pub fn run_full_training(
     // Post-training freeze.
     post_training_freeze(mesh, mesh.config.mask_prune_threshold);
 
+    // Evaluate final detection accuracy.
+    metrics.final_detection_accuracy =
+        evaluate_detection_accuracy(mesh, &dataset, &baselines, config.mesh_steps_per_sample, 100);
+
     metrics
 }
 
@@ -513,6 +561,125 @@ mod tests {
             .iter()
             .any(|step| step.iter().any(|s| s.is_some()));
         assert!(has_snapshots, "No neuron snapshots recorded in any step");
+    }
+
+    #[test]
+    fn detection_loss_decreases_with_training() {
+        use crate::circuit::CircuitType;
+
+        let mut mesh = build_default_mesh();
+        initialize_connections(&mut mesh, 42);
+
+        // Generate a small dataset with mixed anomaly types.
+        let mut gen = SyntheticWellGenerator::new(42);
+        let dataset = gen.generate_dataset(12, 50);
+
+        // Build baselines from the first few sequences.
+        let mut baselines = Baselines::new();
+        for seq in dataset.iter().take(6) {
+            for wits in &seq.wits_samples {
+                baselines.update(wits);
+            }
+        }
+
+        // Only train detection circuits; freeze everything else.
+        let detection_ids: Vec<u32> = mesh
+            .circuits
+            .iter()
+            .filter(|c| c.circuit_type == CircuitType::Detection)
+            .map(|c| c.id)
+            .collect();
+        let freeze: Vec<u32> = mesh
+            .circuits
+            .iter()
+            .map(|c| c.id)
+            .filter(|id| !detection_ids.contains(id))
+            .collect();
+
+        let mut optimizer = AdamOptimizer::from_mesh(&mesh, 1e-3);
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut losses = Vec::new();
+
+        for _step in 0..100 {
+            let seq_idx = rand::Rng::gen_range(&mut rng, 0..dataset.len());
+            let seq = &dataset[seq_idx];
+            let sample_idx = rand::Rng::gen_range(&mut rng, 0..seq.wits_samples.len());
+
+            encode_input(&mut mesh, &seq.wits_samples[sample_idx], &baselines);
+
+            let mut record = ForwardRecord::new(mesh.neurons.len(), 50);
+            recorded_forward_pass(&mut mesh, &mut record, 50);
+
+            let det_labels = detection_labels_for_sample(seq, sample_idx);
+            let (det_loss, det_dl_dx) = loss::detection_loss(&mesh, &det_labels);
+
+            losses.push(det_loss);
+
+            let mut grads = GradientAccumulator::from_mesh(&mesh);
+            backprop_through_time(&mesh, &record, &det_dl_dx, &mut grads);
+            grads.clip_global_norm(1.0);
+            optimizer.step(&mut mesh, &grads, &freeze, true);
+        }
+
+        // All losses should be finite (no NaN/Inf).
+        assert!(
+            losses.iter().all(|l| l.is_finite()),
+            "All losses should be finite"
+        );
+
+        // Loss should decrease: compare first 10 vs last 10 steps.
+        let early_avg: f32 = losses[..10].iter().sum::<f32>() / 10.0;
+        let late_avg: f32 = losses[90..].iter().sum::<f32>() / 10.0;
+        assert!(
+            late_avg < early_avg,
+            "Detection loss should decrease: early_avg={early_avg:.4}, late_avg={late_avg:.4}"
+        );
+    }
+
+    #[test]
+    #[ignore] // Takes ~30s. Run with: cargo test full_pipeline_learns -- --ignored
+    fn full_pipeline_learns() {
+        let config = TrainingConfig {
+            stage1_steps: 50,
+            stage2_rounds: 2,
+            stage2_steps_per_round: 100,
+            stage2_memory_steps: 30,
+            stage2_prediction_steps: 30,
+            stage3_steps: 100,
+            mesh_steps_per_sample: 50,
+            synthetic_sequences: 12,
+            sequence_length: 50,
+            ..TrainingConfig::default()
+        };
+
+        let mut mesh = build_default_mesh();
+        let metrics = run_full_training(&mut mesh, &config);
+
+        // Stage 2 detection losses should trend downward (or at least not explode).
+        if metrics.stage2_detection_losses.len() >= 4 {
+            let mid = metrics.stage2_detection_losses.len() / 2;
+            let first_half: f32 =
+                metrics.stage2_detection_losses[..mid].iter().sum::<f32>() / mid as f32;
+            let second_half: f32 = metrics.stage2_detection_losses[mid..].iter().sum::<f32>()
+                / (metrics.stage2_detection_losses.len() - mid) as f32;
+            assert!(
+                second_half <= first_half * 1.5,
+                "Stage 2 detection loss should not explode: first_half={first_half:.4}, second_half={second_half:.4}"
+            );
+        }
+
+        // Stage 3 losses should be finite.
+        assert!(
+            metrics.stage3_losses.iter().all(|l| l.is_finite()),
+            "Stage 3 losses should all be finite"
+        );
+
+        // Final detection accuracy should be above chance (50%).
+        assert!(
+            metrics.final_detection_accuracy > 0.5,
+            "Detection accuracy should be above chance: {:.1}%",
+            metrics.final_detection_accuracy * 100.0
+        );
     }
 
     #[test]

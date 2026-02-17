@@ -14,6 +14,6 @@ pub mod state;
 pub mod synthetic;
 
 pub use optimizer::AdamOptimizer;
-pub use pipeline::{run_full_training, TrainingConfig, TrainingMetrics};
+pub use pipeline::{evaluate_detection_accuracy, run_full_training, TrainingConfig, TrainingMetrics};
 pub use state::{ForwardRecord, GradientAccumulator};
 pub use synthetic::SyntheticWellGenerator;
