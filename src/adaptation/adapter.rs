@@ -1,7 +1,7 @@
 //! Adapter layers: thin transformation between frozen universal circuits
 //! and plastic adaptive circuits.
 
-use crate::neuron::LiquidNeuron;
+use crate::neuron::LtcNeuron;
 use serde::{Deserialize, Serialize};
 
 /// A single adapter neuron (not part of the main mesh neuron array).
@@ -65,8 +65,8 @@ impl AdapterLayer {
     /// activations, write to adaptive circuit input neurons.
     pub fn forward(
         &mut self,
-        universal_neurons: &[LiquidNeuron],
-        adaptive_neurons: &mut [LiquidNeuron],
+        universal_neurons: &[LtcNeuron],
+        adaptive_neurons: &mut [LtcNeuron],
     ) {
         // Gather inputs from universal mesh.
         let inputs: Vec<f32> = self
@@ -114,10 +114,7 @@ impl AdapterLayer {
         }
     }
 
-    /// Simple gradient-free training step (perturbation-based).
-    ///
-    /// For proper gradient-based training, this would need backprop.
-    /// This is a placeholder that adjusts weights based on error signal.
+    /// Placeholder for gradient-free training step.
     pub fn train_step(
         &mut self,
         _universal_output: &[f32],
@@ -127,18 +124,16 @@ impl AdapterLayer {
         if !self.trainable {
             return;
         }
-        // Training implementation will be added in Phase 6.
-        // This is a structural placeholder.
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neuron::LiquidNeuron;
+    use crate::neuron::LtcNeuron;
 
-    fn make_neurons(count: usize) -> Vec<LiquidNeuron> {
-        (0..count).map(|_| LiquidNeuron::new()).collect()
+    fn make_neurons(count: usize) -> Vec<LtcNeuron> {
+        (0..count).map(|_| LtcNeuron::new()).collect()
     }
 
     #[test]
@@ -151,7 +146,6 @@ mod tests {
 
         let mut adapter = AdapterLayer::new(4, vec![0, 1], vec![3, 4]);
 
-        // Set some non-zero weights so the adapter does something.
         for neuron in &mut adapter.neurons {
             neuron.weights_in = vec![0.5, 0.5];
             neuron.weights_out = vec![0.3, 0.3];
@@ -160,7 +154,6 @@ mod tests {
 
         adapter.forward(&universal, &mut adaptive);
 
-        // Adapter neurons should have activations.
         assert!(adapter.neurons.iter().any(|n| n.x.abs() > 0.0));
     }
 
@@ -168,15 +161,13 @@ mod tests {
     fn frozen_adapter_does_not_train() {
         let mut adapter = AdapterLayer::new(4, vec![0, 1], vec![3, 4]);
         adapter.trainable = false;
-
-        // This should be a no-op.
         adapter.train_step(&[], &std::collections::HashMap::new(), 1e-3);
     }
 
     #[test]
     fn adapter_neuron_tanh_bounded() {
         let mut universal = make_neurons(2);
-        universal[0].x = 100.0; // Extreme value.
+        universal[0].x = 100.0;
         universal[1].x = -100.0;
 
         let mut adaptive = make_neurons(2);
@@ -189,7 +180,6 @@ mod tests {
 
         adapter.forward(&universal, &mut adaptive);
 
-        // All adapter neurons should have |x| ≤ 1 due to tanh.
         for n in &adapter.neurons {
             assert!(n.x.abs() <= 1.0, "Adapter neuron exceeded tanh bounds: {}", n.x);
         }

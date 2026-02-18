@@ -1,19 +1,38 @@
 //! Backward pass implementations for all trainable components.
 //!
 //! Implements manual backpropagation through:
-//! - Liquid neuron dynamics (BPTT through ODE steps)
-//! - Overlap gate MLP (6→8→2 with ReLU + softmax)
-//! - Write gates (linear → sigmoid)
+//! - LTC/CfC neuron dynamics (BPTT with analytical CfC gradients)
+//! - Write gates (linear -> sigmoid)
 //! - Overlap masks (with L1 penalty)
 
 use crate::mesh::OverlappingMesh;
-use crate::training::state::{ForwardRecord, GateGradient, GradientAccumulator};
 
-/// Backpropagate through all recorded mesh steps (BPTT).
+use crate::training::state::{ForwardRecord, GradientAccumulator};
+
+/// Backpropagate through all recorded mesh steps (BPTT) for CfC neurons.
 ///
-/// `dl_dx_output` contains ∂L/∂x for each neuron at the final step
-/// (from the loss function). This function accumulates weight/bias
+/// `dl_dx_output` contains dL/dx for each neuron at the final step
+/// (from the loss function). This function accumulates weight/bias/gate/tau
 /// gradients into `grads`.
+///
+/// CfC forward:
+///   f = sigmoid(gate_sum)
+///   A = tanh(drive_sum)
+///   alpha = 1/tau + f
+///   E = exp(-alpha * dt)
+///   x_new = x_prev * E + (f * A / alpha) * (1 - E)
+///
+/// Analytical gradients:
+///   dx_new/dx_prev = E
+///   dx_new/df = dt * E * (f*A/alpha - x_prev) + A/(tau*alpha^2) * (1 - E)
+///   dx_new/dA = (f/alpha) * (1 - E)
+///   dx_new/dtau = dt*E/tau^2 * (x_prev - f*A/alpha) + f*A/(alpha^2*tau^2) * (1 - E)
+///
+/// Chain rules:
+///   df/dgate_sum = f * (1 - f)
+///   dA/ddrive_sum = 1 - A^2
+///   ddrive_sum/dw_i = x_src_i,  ddrive_sum/dbias = 1
+///   dgate_sum/dgate_w_i = x_src_i,  dgate_sum/dgate_bias = 1
 pub fn backprop_through_time(
     mesh: &OverlappingMesh,
     record: &ForwardRecord,
@@ -22,7 +41,7 @@ pub fn backprop_through_time(
 ) {
     let dt = mesh.config.dt;
 
-    // Initialize ∂L/∂x from the loss output.
+    // Initialize dL/dx from the loss output.
     for (i, &dl) in dl_dx_output.iter().enumerate() {
         grads.dx[i] = dl;
     }
@@ -33,54 +52,88 @@ pub fn backprop_through_time(
         let mut upstream_dx = vec![0.0f32; record.neuron_count];
 
         for neuron_idx in 0..record.neuron_count {
-            let snapshot = match &record.step_snapshots[step][neuron_idx] {
-                Some(s) => s,
-                None => continue, // Neuron was not updated this step.
-            };
+            let inter = &record.step_intermediates[step][neuron_idx];
 
             let dl_dx_curr = grads.dx[neuron_idx];
             if dl_dx_curr.abs() < 1e-12 {
                 continue;
             }
 
-            // For overlap neurons, multiple circuits may have updated.
-            // Use average tau for gradient computation (simplified).
-            let tau = if snapshot.circuit_updates.is_empty() {
-                0.01 // fallback
-            } else {
-                snapshot.circuit_updates.iter().map(|(_, t)| t).sum::<f32>()
-                    / snapshot.circuit_updates.len() as f32
-            };
+            let f = inter.f;
+            let a = inter.a;
+            let alpha = inter.alpha;
+            let exp_term = inter.exp_term;
+            let x_prev = inter.x_prev;
+            let tau = inter.tau;
 
-            // Gradient through the liquid neuron step:
-            // x_{t+1} = x_t + (-x_t + tanh(s_t)) / tau * dt
-            // where s_t = Σ(w_i * x_i_t) + bias
-            let tanh_deriv = 1.0 - snapshot.tanh_val * snapshot.tanh_val;
-            let dx_ds = tanh_deriv * dt / tau;
-            let dx_dx_prev = 1.0 - dt / tau;
+            // Precompute common terms.
+            let f_a_over_alpha = f * a / alpha;
+            let one_minus_e = 1.0 - exp_term;
 
-            // Accumulate bias gradient.
-            grads.bias_grads[neuron_idx] += dl_dx_curr * dx_ds;
+            // dx_new/df = dt * E * (f*A/alpha - x_prev) + A/(tau*alpha^2) * (1 - E)
+            let dx_df = dt * exp_term * (f_a_over_alpha - x_prev)
+                + a / (tau * alpha * alpha) * one_minus_e;
 
-            // Accumulate weight gradients and upstream gradients.
+            // dx_new/dA = (f/alpha) * (1 - E)
+            let dx_da = (f / alpha) * one_minus_e;
+
+            // dx_new/dtau = dt*E/tau^2*(x_prev - f*A/alpha) + f*A/(alpha^2*tau^2)*(1-E)
+            let tau_sq = tau * tau;
+            let dx_dtau = dt * exp_term / tau_sq * (x_prev - f_a_over_alpha)
+                + f * a / (alpha * alpha * tau_sq) * one_minus_e;
+
+            // dx_new/dx_prev = E
+            let dx_dx_prev = exp_term;
+
+            // Chain through gate: df/dgate_sum = f*(1-f)
+            let df_dgate_sum = f * (1.0 - f);
+
+            // Chain through drive: dA/ddrive_sum = 1 - A^2
+            let da_ddrive_sum = 1.0 - a * a;
+
+            // Full chain: dL/dgate_sum = dL/dx_new * dx_new/df * df/dgate_sum
+            let dl_dgate_sum = dl_dx_curr * dx_df * df_dgate_sum;
+
+            // Full chain: dL/ddrive_sum = dL/dx_new * dx_new/dA * dA/ddrive_sum
+            let dl_ddrive_sum = dl_dx_curr * dx_da * da_ddrive_sum;
+
+            // Accumulate bias gradient: ddrive_sum/dbias = 1
+            grads.bias_grads[neuron_idx] += dl_ddrive_sum;
+
+            // Accumulate gate_bias gradient: dgate_sum/dgate_bias = 1
+            grads.gate_bias_grads[neuron_idx] += dl_dgate_sum;
+
+            // Accumulate tau gradient: dL/dtau = dL/dx_new * dx_new/dtau
+            grads.tau_grads[neuron_idx] += dl_dx_curr * dx_dtau;
+
+            // Accumulate weight gradients and upstream gradients to source neurons.
             let neuron = &mesh.neurons[neuron_idx];
-            for (conn_idx, &(src_idx, weight)) in neuron.connections.iter().enumerate() {
-                // ∂s/∂w = x_src at snapshot time.
-                // We use the recorded x for the source neuron.
-                let x_src = if let Some(src_snap) = &record.step_snapshots[step][src_idx] {
-                    src_snap.x
-                } else {
-                    // Source wasn't updated this step — use its most recent known value.
-                    // Approximation: use current mesh state (after full forward).
-                    mesh.neurons[src_idx].x
-                };
+            for (conn_idx, &(src_idx, _drive_w)) in neuron.connections.iter().enumerate() {
+                // Get source neuron x at the time of this step.
+                // Use the x_prev from source neuron's intermediate at this step,
+                // which is the state before update (i.e., the value used in the sums).
+                let x_src = record.step_intermediates[step][src_idx].x_prev;
 
+                // Drive weight gradient: dL/dw_i = dL/ddrive_sum * x_src
                 if conn_idx < grads.weight_grads[neuron_idx].len() {
-                    grads.weight_grads[neuron_idx][conn_idx] += dl_dx_curr * dx_ds * x_src;
+                    grads.weight_grads[neuron_idx][conn_idx] += dl_ddrive_sum * x_src;
                 }
 
-                // Upstream gradient to source neuron.
-                upstream_dx[src_idx] += dl_dx_curr * dx_ds * weight;
+                // Gate weight gradient: dL/dgate_w_i = dL/dgate_sum * x_src
+                if conn_idx < grads.gate_weight_grads[neuron_idx].len() {
+                    grads.gate_weight_grads[neuron_idx][conn_idx] += dl_dgate_sum * x_src;
+                }
+
+                // Upstream gradient to source neuron through drive path:
+                //   dL/dx_src += dL/ddrive_sum * drive_w
+                let drive_w = neuron.connections[conn_idx].1;
+                upstream_dx[src_idx] += dl_ddrive_sum * drive_w;
+
+                // Upstream gradient to source neuron through gate path:
+                //   dL/dx_src += dL/dgate_sum * gate_w
+                if conn_idx < neuron.gate_weights.len() {
+                    upstream_dx[src_idx] += dl_dgate_sum * neuron.gate_weights[conn_idx];
+                }
             }
 
             // Propagate gradient to previous timestep for this neuron.
@@ -94,62 +147,10 @@ pub fn backprop_through_time(
     }
 }
 
-/// Backpropagate through an overlap gate MLP.
-///
-/// Given ∂L/∂priority_a and ∂L/∂priority_b (from the merge operation),
-/// computes gradients for all gate weights.
-///
-/// Returns (∂L/∂delta_a, ∂L/∂delta_b) for upstream propagation.
-pub fn backprop_gate(
-    input: &[f32; 6],
-    hidden: &[f32; 8],
-    priorities: (f32, f32),
-    dl_dp_a: f32,
-    dl_dp_b: f32,
-    gate_grad: &mut GateGradient,
-    weights_ih: &[[f32; 6]; 8],
-    weights_ho: &[[f32; 8]; 2],
-) -> (f32, f32) {
-    let (p_a, p_b) = priorities;
-
-    // Softmax backward: ∂L/∂logit_i = p_i * (∂L/∂p_i - Σ_j(∂L/∂p_j * p_j))
-    let sum_dl_p = dl_dp_a * p_a + dl_dp_b * p_b;
-    let dl_dlogit_a = p_a * (dl_dp_a - sum_dl_p);
-    let dl_dlogit_b = p_b * (dl_dp_b - sum_dl_p);
-    let dl_dlogits = [dl_dlogit_a, dl_dlogit_b];
-
-    // Output layer backward: logit_i = Σ_j(w_ho[i][j] * h_j) + b_o[i]
-    let mut dl_dhidden = [0.0f32; 8];
-    for i in 0..2 {
-        gate_grad.d_bias_o[i] += dl_dlogits[i];
-        for j in 0..8 {
-            gate_grad.d_weights_ho[i][j] += dl_dlogits[i] * hidden[j];
-            dl_dhidden[j] += dl_dlogits[i] * weights_ho[i][j];
-        }
-    }
-
-    // Hidden layer backward (ReLU): h_j = max(0, Σ_k(w_ih[j][k] * input[k]) + b_h[j])
-    let mut dl_dinput = [0.0f32; 6];
-    for j in 0..8 {
-        // ReLU derivative: 1 if hidden[j] > 0, else 0.
-        let relu_grad = if hidden[j] > 0.0 { 1.0 } else { 0.0 };
-        let dl_dpre_h = dl_dhidden[j] * relu_grad;
-
-        gate_grad.d_bias_h[j] += dl_dpre_h;
-        for k in 0..6 {
-            gate_grad.d_weights_ih[j][k] += dl_dpre_h * input[k];
-            dl_dinput[k] += dl_dpre_h * weights_ih[j][k];
-        }
-    }
-
-    // dl_dinput[2] = ∂L/∂delta_a, dl_dinput[5] = ∂L/∂delta_b
-    (dl_dinput[2], dl_dinput[5])
-}
-
-/// Backpropagate through a write gate (linear → sigmoid).
+/// Backpropagate through a write gate (linear -> sigmoid).
 ///
 /// `gate_output`: the sigmoid output from forward pass.
-/// `dl_d_gated`: ∂L/∂(gated_update) from upstream.
+/// `dl_d_gated`: dL/d(gated_update) from upstream.
 /// `ungated_update`: the update that was multiplied by the gate.
 /// `causation_output`: the input to the write gate.
 ///
@@ -160,10 +161,10 @@ pub fn backprop_write_gate(
     ungated_update: f32,
     causation_output: &[f32],
 ) -> (Vec<f32>, f32) {
-    // gated = gate * ungated  →  ∂L/∂gate = ∂L/∂gated * ungated
+    // gated = gate * ungated  ->  dL/dgate = dL/dgated * ungated
     let dl_d_gate = dl_d_gated * ungated_update;
 
-    // sigmoid derivative: σ'(x) = σ(x) * (1 - σ(x))
+    // sigmoid derivative: sigma'(x) = sigma(x) * (1 - sigma(x))
     let sigmoid_deriv = gate_output * (1.0 - gate_output);
     let dl_d_pre = dl_d_gate * sigmoid_deriv;
 
@@ -176,9 +177,8 @@ pub fn backprop_write_gate(
 
 /// Compute gradient for overlap masks.
 ///
-/// `mask_idx`: index within the zone.
 /// `delta`: the neuron update that was scaled by the mask.
-/// `dl_d_effective`: ∂L/∂(effective_delta).
+/// `dl_d_effective`: dL/d(effective_delta).
 /// `sparsity_lambda`: L1 regularization coefficient.
 /// `mask_value`: current mask value.
 pub fn backprop_mask(
@@ -187,10 +187,10 @@ pub fn backprop_mask(
     mask_value: f32,
     sparsity_lambda: f32,
 ) -> f32 {
-    // effective = mask * delta  →  ∂L/∂mask = ∂L/∂effective * delta
+    // effective = mask * delta  ->  dL/dmask = dL/deffective * delta
     let dl_d_mask = dl_d_effective * delta;
 
-    // Plus L1 penalty: ∂(λ|mask|)/∂mask = λ * sign(mask)
+    // Plus L1 penalty: d(lambda|mask|)/dmask = lambda * sign(mask)
     let l1_grad = sparsity_lambda * mask_value.signum();
 
     dl_d_mask + l1_grad
@@ -198,7 +198,7 @@ pub fn backprop_mask(
 
 /// Compute overlap stability loss gradient.
 ///
-/// ∂/∂mask (λ * (mask - mask_ref)²) = 2λ * (mask - mask_ref)
+/// d/dmask (lambda * (mask - mask_ref)^2) = 2*lambda * (mask - mask_ref)
 pub fn backprop_stability(mask_value: f32, mask_ref: f32, stability_lambda: f32) -> f32 {
     2.0 * stability_lambda * (mask_value - mask_ref)
 }
@@ -206,38 +206,7 @@ pub fn backprop_stability(mask_value: f32, mask_ref: f32, stability_lambda: f32)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::training::state::GateGradient;
-
-    #[test]
-    fn gate_backward_softmax_gradients() {
-        // With equal priorities, equal upstream gradients should produce zero.
-        let input = [0.5, 0.01, 0.1, 0.3, 0.05, -0.1];
-        let hidden = [0.0f32; 8]; // All zeros (from zero-init gate).
-        let priorities = (0.5, 0.5);
-        let mut gg = GateGradient::zeros();
-
-        let (_, _) = backprop_gate(
-            &input,
-            &hidden,
-            priorities,
-            1.0,
-            1.0,
-            &mut gg,
-            &[[0.0; 6]; 8],
-            &[[0.0; 8]; 2],
-        );
-
-        // With equal upstream gradients (1.0, 1.0) and equal priorities (0.5, 0.5):
-        // sum_dl_p = 1.0*0.5 + 1.0*0.5 = 1.0
-        // dl_dlogit_a = 0.5 * (1.0 - 1.0) = 0.0
-        // dl_dlogit_b = 0.5 * (1.0 - 1.0) = 0.0
-        // So all gate gradients should be zero.
-        for row in &gg.d_weights_ih {
-            for &g in row {
-                assert!(g.abs() < 1e-9);
-            }
-        }
-    }
+    use crate::neuron::{cfc_forward, LtcNeuron};
 
     #[test]
     fn write_gate_backward_zero_gate() {
@@ -265,47 +234,300 @@ mod tests {
         assert!((grad - 0.04).abs() < 1e-6);
     }
 
+    /// Helper: compute analytic dx/dbias, dx/dgate_bias, dx/dtau for a CfC neuron.
+    /// This uses the full CfC gradient formulas from the intermediates.
+    fn analytic_grads_from_inter(
+        inter: &crate::neuron::CfcIntermediate,
+        dt: f32,
+    ) -> (f32, f32, f32) {
+        let f = inter.f;
+        let a = inter.a;
+        let alpha = inter.alpha;
+        let exp_term = inter.exp_term;
+        let x_prev = inter.x_prev;
+        let tau = inter.tau;
+        let one_minus_e = 1.0 - exp_term;
+        let f_a_over_alpha = f * a / alpha;
+
+        // dx/dA = (f/alpha)*(1-E)
+        let dx_da = (f / alpha) * one_minus_e;
+        // dA/ddrive_sum = 1 - A^2
+        let da_ddrive = 1.0 - a * a;
+        // dx/dbias = dx_da * da_ddrive (bias only affects drive, not gate)
+        let dx_dbias = dx_da * da_ddrive;
+
+        // dx/df = dt * E * (f*A/alpha - x_prev) + A/(tau*alpha^2)*(1-E)
+        let dx_df = dt * exp_term * (f_a_over_alpha - x_prev)
+            + a / (tau * alpha * alpha) * one_minus_e;
+        // df/dgate_bias = f*(1-f)
+        let dx_dgate_bias = dx_df * f * (1.0 - f);
+
+        // dx/dtau = dt*E/tau^2*(x_prev - f*A/alpha) + f*A/(alpha^2*tau^2)*(1-E)
+        let tau_sq = tau * tau;
+        let dx_dtau = dt * exp_term / tau_sq * (x_prev - f_a_over_alpha)
+            + f * a / (alpha * alpha * tau_sq) * one_minus_e;
+
+        (dx_dbias, dx_dgate_bias, dx_dtau)
+    }
+
     #[test]
-    fn numerical_gradient_check_neuron_bias() {
-        // Verify analytic gradient matches numerical gradient for a single neuron's bias.
-        use crate::config::MeshConfig;
-        use crate::neuron::LiquidNeuron;
-        
+    fn numerical_gradient_check_cfc_bias() {
+        // Use larger tau (slower decay => bigger 1-E term) for numerically stable gradients.
+        let dt = 0.1_f32;
+        let eps = 1e-4_f32;
+        let base_bias = 0.5_f32;
 
-        let _config = MeshConfig {
-            total_neurons: 2,
-            dt: 0.001,
-            ..MeshConfig::default()
-        };
-
-        // Function: run one neuron step, return x.
         let run = |bias: f32| -> f32 {
-            let mut neuron = LiquidNeuron::new();
+            let mut neuron = LtcNeuron::new();
             neuron.bias = bias;
             neuron.x = 0.3;
-            // dx = (-0.3 + tanh(bias)) / tau * dt
-            let tau = 0.01;
-            let dt = 0.001;
-            let input_sum = bias;
-            let dx = (-neuron.x + input_sum.tanh()) / tau * dt;
-            neuron.x + dx
+            neuron.tau = 1.0; // Slow tau => alpha ~ 1 + f ~ 1.5
+            let neurons = [neuron.clone()];
+            let (x_new, _) = cfc_forward(&neuron, &neurons, dt);
+            x_new
         };
 
-        let bias = 0.5;
-        let eps = 1e-4;
+        let numerical = (run(base_bias + eps) - run(base_bias - eps)) / (2.0 * eps);
 
-        let numerical = (run(bias + eps) - run(bias - eps)) / (2.0 * eps);
+        let mut neuron = LtcNeuron::new();
+        neuron.bias = base_bias;
+        neuron.x = 0.3;
+        neuron.tau = 1.0;
+        let neurons = [neuron.clone()];
+        let (_, inter) = cfc_forward(&neuron, &neurons, dt);
 
-        // Analytic: ∂x_new/∂bias = (1 - tanh²(bias)) * dt / tau
-        let tau = 0.01_f32;
-        let dt = 0.001_f32;
-        let tanh_val = bias.tanh();
-        let analytic = (1.0 - tanh_val * tanh_val) * dt / tau;
+        let (analytic, _, _) = analytic_grads_from_inter(&inter, dt);
 
-        let relative_error = (analytic - numerical).abs() / (analytic.abs() + numerical.abs() + 1e-8);
+        let relative_error =
+            (analytic - numerical).abs() / (analytic.abs() + numerical.abs() + 1e-8);
         assert!(
-            relative_error < 1e-3,
-            "Gradient check failed: analytic={analytic}, numerical={numerical}, rel_err={relative_error}"
+            relative_error < 0.01,
+            "Bias gradient check failed: analytic={analytic}, numerical={numerical}, rel_err={relative_error}"
+        );
+    }
+
+    #[test]
+    fn numerical_gradient_check_cfc_gate_bias() {
+        // Use larger dt and larger eps for cleaner numerics.
+        // The gate_bias gradient goes through f which has a small effect on x,
+        // so we need large enough perturbation to get above float32 noise.
+        let dt = 0.5_f32;
+        let eps = 1e-3_f32;
+        let base_gate_bias = 0.0_f32;
+
+        let run = |gate_bias: f32| -> f32 {
+            let mut neuron = LtcNeuron::new();
+            neuron.bias = 0.5;
+            neuron.gate_bias = gate_bias;
+            neuron.x = 0.3;
+            neuron.tau = 1.0;
+            let neurons = [neuron.clone()];
+            let (x_new, _) = cfc_forward(&neuron, &neurons, dt);
+            x_new
+        };
+
+        let numerical = (run(base_gate_bias + eps) - run(base_gate_bias - eps)) / (2.0 * eps);
+
+        let mut neuron = LtcNeuron::new();
+        neuron.bias = 0.5;
+        neuron.gate_bias = base_gate_bias;
+        neuron.x = 0.3;
+        neuron.tau = 1.0;
+        let neurons = [neuron.clone()];
+        let (_, inter) = cfc_forward(&neuron, &neurons, dt);
+
+        let (_, analytic, _) = analytic_grads_from_inter(&inter, dt);
+
+        let relative_error =
+            (analytic - numerical).abs() / (analytic.abs() + numerical.abs() + 1e-8);
+        assert!(
+            relative_error < 0.02,
+            "Gate bias gradient check failed: analytic={analytic}, numerical={numerical}, rel_err={relative_error}"
+        );
+    }
+
+    #[test]
+    fn numerical_gradient_check_cfc_tau() {
+        let dt = 0.1_f32;
+        let eps = 1e-5_f32;
+        let base_tau = 1.0_f32;
+
+        let run = |tau: f32| -> f32 {
+            let mut neuron = LtcNeuron::new();
+            neuron.bias = 0.5;
+            neuron.x = 0.3;
+            neuron.tau = tau;
+            let neurons = [neuron.clone()];
+            let (x_new, _) = cfc_forward(&neuron, &neurons, dt);
+            x_new
+        };
+
+        let numerical = (run(base_tau + eps) - run(base_tau - eps)) / (2.0 * eps);
+
+        let mut neuron = LtcNeuron::new();
+        neuron.bias = 0.5;
+        neuron.x = 0.3;
+        neuron.tau = base_tau;
+        let neurons = [neuron.clone()];
+        let (_, inter) = cfc_forward(&neuron, &neurons, dt);
+
+        let (_, _, analytic) = analytic_grads_from_inter(&inter, dt);
+
+        let relative_error =
+            (analytic - numerical).abs() / (analytic.abs() + numerical.abs() + 1e-8);
+        assert!(
+            relative_error < 0.01,
+            "Tau gradient check failed: analytic={analytic}, numerical={numerical}, rel_err={relative_error}"
+        );
+    }
+
+    #[test]
+    fn numerical_gradient_check_cfc_weight() {
+        // Use larger tau and dt for stable numerical gradients.
+        let dt = 0.1_f32;
+        let eps = 1e-4_f32;
+        let base_w = 0.3_f32;
+
+        let run = |w: f32| -> f32 {
+            let n0 = LtcNeuron {
+                x: 0.5,
+                tau: 1.0,
+                bias: 0.0,
+                gate_bias: 0.0,
+                connections: vec![],
+                gate_weights: vec![],
+                circuit_membership_count: 0,
+            };
+            let n1 = LtcNeuron {
+                x: 0.1,
+                tau: 1.0,
+                bias: 0.2,
+                gate_bias: 0.0,
+                connections: vec![(0, w)],
+                gate_weights: vec![0.0],
+                circuit_membership_count: 0,
+            };
+            let neurons = [n0, n1.clone()];
+            let (x_new, _) = cfc_forward(&n1, &neurons, dt);
+            x_new
+        };
+
+        let numerical = (run(base_w + eps) - run(base_w - eps)) / (2.0 * eps);
+
+        // Analytic.
+        let n0 = LtcNeuron {
+            x: 0.5,
+            tau: 1.0,
+            bias: 0.0,
+            gate_bias: 0.0,
+            connections: vec![],
+            gate_weights: vec![],
+            circuit_membership_count: 0,
+        };
+        let n1 = LtcNeuron {
+            x: 0.1,
+            tau: 1.0,
+            bias: 0.2,
+            gate_bias: 0.0,
+            connections: vec![(0, base_w)],
+            gate_weights: vec![0.0],
+            circuit_membership_count: 0,
+        };
+        let neurons = [n0, n1.clone()];
+        let (_, inter) = cfc_forward(&n1, &neurons, dt);
+
+        let f = inter.f;
+        let a = inter.a;
+        let alpha = inter.alpha;
+        let one_minus_e = 1.0 - inter.exp_term;
+
+        let dx_da = (f / alpha) * one_minus_e;
+        let da_ddrive = 1.0 - a * a;
+        let x_src = 0.5_f32;
+        let analytic = dx_da * da_ddrive * x_src;
+
+        let relative_error =
+            (analytic - numerical).abs() / (analytic.abs() + numerical.abs() + 1e-8);
+        assert!(
+            relative_error < 0.01,
+            "Weight gradient check failed: analytic={analytic}, numerical={numerical}, rel_err={relative_error}"
+        );
+    }
+
+    #[test]
+    fn numerical_gradient_check_cfc_gate_weight() {
+        let dt = 0.1_f32;
+        let eps = 1e-4_f32;
+        let base_gw = 0.2_f32;
+
+        let run = |gw: f32| -> f32 {
+            let n0 = LtcNeuron {
+                x: 0.5,
+                tau: 1.0,
+                bias: 0.0,
+                gate_bias: 0.0,
+                connections: vec![],
+                gate_weights: vec![],
+                circuit_membership_count: 0,
+            };
+            let n1 = LtcNeuron {
+                x: 0.1,
+                tau: 1.0,
+                bias: 0.2,
+                gate_bias: 0.0,
+                connections: vec![(0, 0.3)],
+                gate_weights: vec![gw],
+                circuit_membership_count: 0,
+            };
+            let neurons = [n0, n1.clone()];
+            let (x_new, _) = cfc_forward(&n1, &neurons, dt);
+            x_new
+        };
+
+        let numerical = (run(base_gw + eps) - run(base_gw - eps)) / (2.0 * eps);
+
+        // Analytic.
+        let n0 = LtcNeuron {
+            x: 0.5,
+            tau: 1.0,
+            bias: 0.0,
+            gate_bias: 0.0,
+            connections: vec![],
+            gate_weights: vec![],
+            circuit_membership_count: 0,
+        };
+        let n1 = LtcNeuron {
+            x: 0.1,
+            tau: 1.0,
+            bias: 0.2,
+            gate_bias: 0.0,
+            connections: vec![(0, 0.3)],
+            gate_weights: vec![base_gw],
+            circuit_membership_count: 0,
+        };
+        let neurons = [n0, n1.clone()];
+        let (_, inter) = cfc_forward(&n1, &neurons, dt);
+
+        let f = inter.f;
+        let a = inter.a;
+        let alpha = inter.alpha;
+        let exp_term = inter.exp_term;
+        let x_prev = inter.x_prev;
+        let tau = inter.tau;
+        let one_minus_e = 1.0 - exp_term;
+        let f_a_over_alpha = f * a / alpha;
+
+        let dx_df = dt * exp_term * (f_a_over_alpha - x_prev)
+            + a / (tau * alpha * alpha) * one_minus_e;
+        let df_dgate = f * (1.0 - f);
+        let x_src = 0.5_f32;
+        let analytic = dx_df * df_dgate * x_src;
+
+        let relative_error =
+            (analytic - numerical).abs() / (analytic.abs() + numerical.abs() + 1e-8);
+        assert!(
+            relative_error < 0.01,
+            "Gate weight gradient check failed: analytic={analytic}, numerical={numerical}, rel_err={relative_error}"
         );
     }
 }

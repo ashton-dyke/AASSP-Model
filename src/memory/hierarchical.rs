@@ -4,7 +4,7 @@
 //! that controls whether new information is stored.
 
 use crate::circuit::{Circuit, CircuitCriticality, CircuitType};
-use crate::neuron::LiquidNeuron;
+use crate::neuron::LtcNeuron;
 use serde::{Deserialize, Serialize};
 
 /// Learned write gate: determines whether causation output should be
@@ -71,7 +71,7 @@ impl MemoryCircuit {
     /// optionally write new information gated by causation output.
     pub fn update(
         &mut self,
-        neurons: &mut [LiquidNeuron],
+        neurons: &mut [LtcNeuron],
         causation_output: &[f32],
         dt: f32,
     ) {
@@ -84,10 +84,11 @@ impl MemoryCircuit {
         // Step 2: Compute write gate.
         let gate_value = self.write_gate.forward(causation_output);
 
-        // Step 3: Gated write (standard liquid neuron update scaled by gate).
+        // Step 3: Gated write — compute CfC update and scale by gate.
         if gate_value > 0.05 {
-            let updates = self.circuit.compute_updates(neurons, dt);
-            for (neuron_idx, delta) in updates {
+            let updates = self.circuit.compute_cfc_updates(neurons, dt);
+            for (neuron_idx, new_x) in updates {
+                let delta = new_x - neurons[neuron_idx].x;
                 neurons[neuron_idx].x += gate_value * delta;
             }
         }
@@ -107,11 +108,6 @@ pub struct HierarchicalMemory {
 
 impl HierarchicalMemory {
     /// Create the three-level memory system with default parameters.
-    ///
-    /// - `short_range`: neuron index range for short-term memory
-    /// - `medium_range`: neuron index range for medium-term memory
-    /// - `long_range`: neuron index range for long-term memory
-    /// - `causation_dim`: number of causation output features (for write gates)
     pub fn new(
         short_range: std::ops::Range<usize>,
         medium_range: std::ops::Range<usize>,
@@ -119,10 +115,10 @@ impl HierarchicalMemory {
         causation_dim: usize,
     ) -> Self {
         let short_circuit = Circuit::new(
-            100, // Memory circuit IDs start at 100.
+            100,
             "short_term_memory",
             short_range.collect(),
-            0.2,  // tau = 200ms
+            0.2,
             CircuitType::Memory,
             CircuitCriticality::Performance,
         );
@@ -131,7 +127,7 @@ impl HierarchicalMemory {
             101,
             "medium_term_memory",
             medium_range.collect(),
-            2.0,  // tau = 2s
+            2.0,
             CircuitType::Memory,
             CircuitCriticality::Performance,
         );
@@ -140,7 +136,7 @@ impl HierarchicalMemory {
             102,
             "long_term_memory",
             long_range.collect(),
-            30.0,  // tau = 30s
+            30.0,
             CircuitType::Memory,
             CircuitCriticality::Performance,
         );
@@ -155,7 +151,7 @@ impl HierarchicalMemory {
     /// Update all three memory levels.
     pub fn update(
         &mut self,
-        neurons: &mut [LiquidNeuron],
+        neurons: &mut [LtcNeuron],
         causation_output: &[f32],
         dt: f32,
     ) {
@@ -168,17 +164,16 @@ impl HierarchicalMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neuron::LiquidNeuron;
+    use crate::neuron::LtcNeuron;
     use approx::assert_abs_diff_eq;
 
-    fn make_neurons(count: usize) -> Vec<LiquidNeuron> {
-        (0..count).map(|_| LiquidNeuron::new()).collect()
+    fn make_neurons(count: usize) -> Vec<LtcNeuron> {
+        (0..count).map(|_| LtcNeuron::new()).collect()
     }
 
     #[test]
     fn write_gate_sigmoid_bounds() {
         let gate = WriteGate::new(3);
-        // With all-zero weights, output should be sigmoid(0) = 0.5.
         let output = gate.forward(&[1.0, 2.0, 3.0]);
         assert_abs_diff_eq!(output, 0.5, epsilon = 1e-6);
     }
@@ -213,17 +208,11 @@ mod tests {
         );
         let mut mem = MemoryCircuit::new(circuit, 0.7, 3);
 
-        let dt = 0.1; // 100ms
-        let causation_output = vec![0.0, 0.0, 0.0]; // gate ≈ 0.5 (zero weights)
+        let dt = 0.1;
+        let causation_output = vec![0.0, 0.0, 0.0];
         mem.update(&mut neurons, &causation_output, dt);
 
-        // Decay factor = exp(-0.7 * 0.1) = exp(-0.07) ≈ 0.9324
-        let expected_decay = (-0.7_f32 * 0.1).exp();
-        // Neuron 0 should have decayed from 1.0.
-        // (Plus a small write-gated update, but with zero-weight gate ≈ 0.5.)
         assert!(neurons[0].x < 1.0, "Neuron should have decayed");
-        // The decay component dominates — check it's close.
-        assert!(neurons[0].x < expected_decay + 0.1);
     }
 
     #[test]
@@ -237,14 +226,12 @@ mod tests {
         );
         let mut mem = MemoryCircuit::new(circuit, 0.7, 3);
 
-        // Set write gate to strongly negative → gate < 0.05 → no write.
         mem.write_gate.bias = -10.0;
 
         let before = neurons[0].x;
         let dt = 0.1;
         mem.update(&mut neurons, &[0.0, 0.0, 0.0], dt);
 
-        // Only decay should have happened, no gated write.
         let expected = before * (-0.7_f32 * 0.1).exp();
         assert_abs_diff_eq!(neurons[0].x, expected, epsilon = 1e-5);
     }
@@ -261,7 +248,6 @@ mod tests {
 
         memory.update(&mut neurons, &causation, 0.001);
 
-        // All levels should have applied at least decay.
         assert!(neurons[0].x < 0.9);
         assert!(neurons[10].x < 0.7);
         assert!(neurons[20].x < 0.5);
@@ -270,21 +256,18 @@ mod tests {
     #[test]
     fn short_term_decays_faster_than_long_term() {
         let mut neurons = make_neurons(30);
-        neurons[0].x = 1.0;  // short-term
-        neurons[20].x = 1.0; // long-term
+        neurons[0].x = 1.0;
+        neurons[20].x = 1.0;
 
         let mut memory = HierarchicalMemory::new(0..10, 10..20, 20..30, 3);
-        // Block write gates so only decay applies.
         memory.short_term.write_gate.bias = -20.0;
         memory.medium_term.write_gate.bias = -20.0;
         memory.long_term.write_gate.bias = -20.0;
 
-        // Run for 1 second of simulation time.
         for _ in 0..1000 {
             memory.update(&mut neurons, &[0.0; 3], 0.001);
         }
 
-        // Short-term (λ=0.7) should have decayed much more than long-term (λ=0.004).
         assert!(
             neurons[0].x < neurons[20].x,
             "Short-term ({}) should have decayed more than long-term ({})",
@@ -292,8 +275,6 @@ mod tests {
             neurons[20].x
         );
 
-        // Short-term half-life ~1s, so after 1s it should be roughly 0.5.
-        // Long-term half-life ~3min, so after 1s it should be ~0.996.
         assert!(neurons[0].x < 0.6, "Short-term should be well-decayed: {}", neurons[0].x);
         assert!(neurons[20].x > 0.99, "Long-term should barely have decayed: {}", neurons[20].x);
     }

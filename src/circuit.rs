@@ -1,7 +1,11 @@
-//! Circuit system — logical groupings of neurons with firing control.
+//! Circuit system — logical groupings of neurons.
+//!
+//! Circuits are purely organizational: they define which neurons belong to
+//! which functional group, for training, readout, and initialization.
+//! With LTC/CfC neurons handling their own temporal dynamics, circuits
+//! no longer control firing schedules.
 
-use crate::neuron::{compute_neuron_update, LiquidNeuron};
-use rand::Rng;
+use crate::neuron::LtcNeuron;
 use serde::{Deserialize, Serialize};
 
 /// Unique identifier for a circuit.
@@ -20,15 +24,12 @@ pub enum CircuitType {
     Memory,
 }
 
-/// Determines the firing mode of a circuit.
+/// Safety criticality level — used for output-level safety override.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CircuitCriticality {
-    /// Deterministic firing. Fires when accumulator exceeds tau.
-    /// Used for detection and causation circuits.
+    /// Safety-critical circuit (detection, causation).
     Safety,
-
-    /// Stochastic firing. Fires with probability dt/tau per timestep.
-    /// Used for memory and prediction circuits.
+    /// Performance circuit (memory, prediction).
     Performance,
 }
 
@@ -44,20 +45,18 @@ pub struct Circuit {
     /// Which neurons this circuit reads and writes.
     pub neuron_indices: Vec<usize>,
 
-    /// Time constant in seconds. Small tau = fast updates.
+    /// Suggested initial time constant for neurons in this circuit.
+    /// Used during initialization to set per-neuron tau values.
     pub tau: f32,
 
     /// Circuit function type.
     pub circuit_type: CircuitType,
 
-    /// Criticality level (determines firing mode).
+    /// Criticality level (used for safety override at output level).
     pub criticality: CircuitCriticality,
 
     /// Current confidence output (0.0 to 1.0).
     pub confidence: f32,
-
-    /// Deterministic accumulator for Safety firing.
-    pub fire_accumulator: f32,
 
     /// Whether this circuit's weights are frozen.
     pub frozen: bool,
@@ -81,160 +80,95 @@ impl Circuit {
             circuit_type,
             criticality,
             confidence: 0.0,
-            fire_accumulator: 0.0,
             frozen: false,
         }
     }
 
-    /// Determine whether this circuit should fire this timestep.
-    pub fn should_fire(&mut self, dt: f32, rng: &mut impl Rng) -> bool {
-        match self.criticality {
-            CircuitCriticality::Safety => {
-                self.fire_accumulator += dt;
-                if self.fire_accumulator >= self.tau {
-                    self.fire_accumulator -= self.tau;
-                    true
-                } else {
-                    false
-                }
-            }
-            CircuitCriticality::Performance => rng.gen::<f32>() < (dt / self.tau),
-        }
-    }
-
-    /// Compute proposed updates for all neurons in this circuit.
+    /// Update confidence based on readout neurons.
     ///
-    /// Returns Vec of (neuron_index, proposed_delta).
-    /// Does NOT modify neuron state — the caller handles merge.
-    pub fn compute_updates(&self, neurons: &[LiquidNeuron], dt: f32) -> Vec<(usize, f32)> {
-        let mut updates = Vec::with_capacity(self.neuron_indices.len());
-
-        for &neuron_idx in &self.neuron_indices {
-            let delta = compute_neuron_update(&neurons[neuron_idx], neurons, self.tau, dt);
-            updates.push((neuron_idx, delta));
-        }
-
-        updates
-    }
-
-    /// Update the circuit's confidence based on its output neurons.
-    ///
-    /// Confidence is the mean absolute activation of the circuit's neurons,
-    /// clamped to [0, 1].
-    pub fn update_confidence(&mut self, neurons: &[LiquidNeuron]) {
-        if self.neuron_indices.is_empty() {
+    /// Uses the mean absolute activation of the last 8 neurons.
+    pub fn update_confidence(&mut self, neurons: &[LtcNeuron]) {
+        let n = self.neuron_indices.len();
+        if n == 0 {
             self.confidence = 0.0;
             return;
         }
 
-        let sum: f32 = self
-            .neuron_indices
+        let readout_count = 8.min(n);
+        let start = n - readout_count;
+        let mean_abs: f32 = self.neuron_indices[start..]
             .iter()
             .map(|&idx| neurons[idx].x.abs())
-            .sum();
+            .sum::<f32>()
+            / readout_count as f32;
 
-        self.confidence = (sum / self.neuron_indices.len() as f32).clamp(0.0, 1.0);
+        self.confidence = mean_abs.clamp(0.0, 1.0);
+    }
+
+    /// Compute proposed CfC updates for all neurons in this circuit.
+    ///
+    /// Returns Vec of (neuron_index, new_x_value).
+    pub fn compute_cfc_updates(
+        &self,
+        neurons: &[LtcNeuron],
+        dt: f32,
+    ) -> Vec<(usize, f32)> {
+        self.neuron_indices
+            .iter()
+            .map(|&idx| {
+                let new_x = crate::neuron::cfc_forward_inference(&neurons[idx], neurons, dt);
+                (idx, new_x)
+            })
+            .collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neuron::LiquidNeuron;
-    use rand::rngs::StdRng;
-    use rand::SeedableRng;
 
-    fn make_test_circuit(
-        criticality: CircuitCriticality,
-        tau: f32,
-        neuron_count: usize,
-    ) -> Circuit {
-        Circuit::new(
-            0,
-            "test",
-            (0..neuron_count).collect(),
-            tau,
-            CircuitType::Detection,
-            criticality,
-        )
+    fn make_neurons(n: usize) -> Vec<LtcNeuron> {
+        (0..n).map(|_| LtcNeuron::new()).collect()
     }
 
     #[test]
-    fn safety_fires_at_exact_tau_intervals() {
-        let mut circuit = make_test_circuit(CircuitCriticality::Safety, 0.01, 0);
-        let mut rng = StdRng::seed_from_u64(42);
-        let dt = 0.001;
-        let mut fire_count = 0;
-
-        for _ in 0..1000 {
-            if circuit.should_fire(dt, &mut rng) {
-                fire_count += 1;
-            }
-        }
-
-        // tau=0.01, dt=0.001 → fires every 10 steps → 100 fires in 1000 steps
-        assert_eq!(fire_count, 100);
-    }
-
-    #[test]
-    fn safety_firing_is_deterministic() {
-        let dt = 0.001;
-
-        let mut circuit1 = make_test_circuit(CircuitCriticality::Safety, 0.01, 0);
-        let mut circuit2 = make_test_circuit(CircuitCriticality::Safety, 0.01, 0);
-        let mut rng1 = StdRng::seed_from_u64(42);
-        let mut rng2 = StdRng::seed_from_u64(99); // different seed — shouldn't matter
-
-        for _ in 0..500 {
-            let f1 = circuit1.should_fire(dt, &mut rng1);
-            let f2 = circuit2.should_fire(dt, &mut rng2);
-            assert_eq!(f1, f2, "Safety firing must be deterministic regardless of RNG");
-        }
-    }
-
-    #[test]
-    fn performance_fires_approximately_correct_rate() {
-        let mut circuit = make_test_circuit(CircuitCriticality::Performance, 0.2, 0);
-        let mut rng = StdRng::seed_from_u64(42);
-        let dt = 0.001;
-        let steps = 100_000;
-        let mut fire_count = 0;
-
-        for _ in 0..steps {
-            if circuit.should_fire(dt, &mut rng) {
-                fire_count += 1;
-            }
-        }
-
-        // Expected: steps * (dt / tau) = 100000 * 0.005 = 500
-        let expected = (steps as f32 * dt / circuit.tau) as i32;
-        let tolerance = (expected as f32 * 0.15) as i32; // 15% tolerance
-        assert!(
-            (fire_count - expected).abs() < tolerance,
-            "Expected ~{expected} fires, got {fire_count}"
+    fn circuit_creation() {
+        let c = Circuit::new(
+            0, "test", vec![0, 1, 2], 0.01,
+            CircuitType::Detection, CircuitCriticality::Safety,
         );
+        assert_eq!(c.id, 0);
+        assert_eq!(c.neuron_indices.len(), 3);
+        assert_eq!(c.confidence, 0.0);
+        assert!(!c.frozen);
     }
 
     #[test]
-    fn compute_updates_returns_correct_count() {
-        let neurons: Vec<LiquidNeuron> = (0..10).map(|_| LiquidNeuron::new()).collect();
-        let circuit = make_test_circuit(CircuitCriticality::Safety, 0.01, 5);
-        let updates = circuit.compute_updates(&neurons, 0.001);
-        assert_eq!(updates.len(), 5);
+    fn confidence_update() {
+        let mut neurons = make_neurons(10);
+        neurons[7].x = 0.8;
+        neurons[8].x = 0.6;
+        neurons[9].x = 0.4;
+
+        let mut c = Circuit::new(
+            0, "det", (0..10).collect(), 0.01,
+            CircuitType::Detection, CircuitCriticality::Safety,
+        );
+        c.update_confidence(&neurons);
+        assert!(c.confidence > 0.0);
     }
 
     #[test]
-    fn confidence_reflects_neuron_activations() {
-        let mut neurons: Vec<LiquidNeuron> = (0..4).map(|_| LiquidNeuron::new()).collect();
-        neurons[0].x = 0.5;
-        neurons[1].x = -0.3;
-        neurons[2].x = 0.7;
-        neurons[3].x = 0.1;
+    fn cfc_updates_produce_values() {
+        let mut neurons = make_neurons(5);
+        neurons[0].bias = 0.3;
+        neurons[0].tau = 0.01;
 
-        let mut circuit = make_test_circuit(CircuitCriticality::Safety, 0.01, 4);
-        circuit.update_confidence(&neurons);
-
-        let expected = (0.5 + 0.3 + 0.7 + 0.1) / 4.0;
-        assert!((circuit.confidence - expected).abs() < 1e-5);
+        let c = Circuit::new(
+            0, "det", vec![0, 1, 2], 0.01,
+            CircuitType::Detection, CircuitCriticality::Safety,
+        );
+        let updates = c.compute_cfc_updates(&neurons, 0.001);
+        assert_eq!(updates.len(), 3);
     }
 }

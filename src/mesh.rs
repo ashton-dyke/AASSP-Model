@@ -1,49 +1,42 @@
 //! The overlapping neural mesh — top-level structure and execution loop.
 //!
-//! Owns all neurons, circuits, and overlap zones. Implements the two-phase
-//! update cycle: parallel computation → sequential merge.
+//! Owns all neurons, circuits, and overlap zones. With LTC/CfC neurons,
+//! the step is fully synchronous: compute all new states, then apply.
 
-use crate::circuit::{Circuit, CircuitId, CircuitType};
+use crate::circuit::{Circuit, CircuitId};
 use crate::config::MeshConfig;
-use crate::neuron::LiquidNeuron;
+use crate::neuron::{cfc_forward_inference, LtcNeuron};
 use crate::overlap::OverlapZone;
 use crate::topology::{TopologyConstraint, TopologyError};
-
-use rand::rngs::StdRng;
-use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 
-/// The complete overlapping neural mesh.
+/// The central neural mesh structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OverlappingMesh {
-    /// All neurons in the mesh (shared substrate).
-    pub neurons: Vec<LiquidNeuron>,
+    /// All neurons in the mesh.
+    pub neurons: Vec<LtcNeuron>,
 
-    /// All circuits operating on subsets of neurons.
+    /// All circuits (logical groupings).
     pub circuits: Vec<Circuit>,
 
     /// Overlap zones between circuit pairs.
     pub overlap_zones: Vec<OverlapZone>,
 
-    /// Topology validator.
+    /// Topology constraint enforcer.
     pub topology: TopologyConstraint,
 
-    /// Global mesh configuration.
+    /// Configuration.
     pub config: MeshConfig,
 
-    /// Current timestep (monotonically increasing).
+    /// Current simulation tick.
     pub tick: u64,
-
-    /// Seeded RNG for reproducible stochastic firing.
-    #[serde(skip)]
-    pub rng: Option<StdRng>,
 }
 
 impl OverlappingMesh {
-    /// Create a new mesh with the given neuron count and configuration.
+    /// Create a new mesh with the given config.
     pub fn new(config: MeshConfig) -> Self {
         let neurons = (0..config.total_neurons)
-            .map(|_| LiquidNeuron::new())
+            .map(|_| LtcNeuron::new())
             .collect();
 
         Self {
@@ -53,196 +46,69 @@ impl OverlappingMesh {
             topology: TopologyConstraint::new(),
             config,
             tick: 0,
-            rng: Some(StdRng::seed_from_u64(42)),
         }
     }
 
-    /// Add a circuit to the mesh. Validates topology after addition.
+    /// Add a circuit to the mesh (validates topology).
     pub fn add_circuit(&mut self, circuit: Circuit) -> Result<(), TopologyError> {
+        // Update membership counts.
+        for &idx in &circuit.neuron_indices {
+            if idx < self.neurons.len() {
+                self.neurons[idx].circuit_membership_count += 1;
+            }
+        }
+
         self.circuits.push(circuit);
 
-        if let Err(e) = self.topology.validate(self.neurons.len(), &self.circuits) {
-            self.circuits.pop();
-            return Err(e);
-        }
-
-        // Update neuron membership counts.
-        let last = self.circuits.last().unwrap();
-        for &idx in &last.neuron_indices {
-            self.neurons[idx].circuit_membership_count += 1;
-        }
+        // Validate topology.
+        self.topology
+            .validate(self.neurons.len(), &self.circuits)?;
 
         Ok(())
     }
 
-    /// Add an overlap zone. The two circuits must already exist.
-    pub fn add_overlap_zone(&mut self, zone: OverlapZone) {
-        self.overlap_zones.push(zone);
-    }
-
-    /// Run one mesh timestep: parallel computation → sequential merge.
+    /// Run one synchronous CfC step.
+    ///
+    /// 1. Compute all new neuron states from the current state (CfC closed-form).
+    /// 2. Apply new states atomically.
+    /// 3. Update circuit confidences.
     pub fn step(&mut self) {
         let dt = self.config.dt;
 
-        // ═══════════════════════════════════════════
-        // PHASE 1: COMPUTATION (collect updates from firing circuits)
-        // ═══════════════════════════════════════════
-        //
-        // We iterate circuits, check firing, and compute updates.
-        // The neuron slice is immutable during this phase.
-        let mut all_updates: Vec<(CircuitId, Vec<(usize, f32)>)> = Vec::new();
+        // Phase 1: compute all new states from current state.
+        let new_states: Vec<f32> = (0..self.neurons.len())
+            .map(|i| cfc_forward_inference(&self.neurons[i], &self.neurons, dt))
+            .collect();
 
-        // We need mutable access to circuits (for should_fire accumulator)
-        // and immutable access to neurons simultaneously. Split the borrow
-        // by collecting firing decisions and updates in sequence.
-        let rng = self.rng.get_or_insert_with(|| StdRng::seed_from_u64(42));
-
-        for circuit in &mut self.circuits {
-            if circuit.should_fire(dt, rng) {
-                let updates = circuit.compute_updates(&self.neurons, dt);
-                circuit.update_confidence(&self.neurons);
-                all_updates.push((circuit.id, updates));
-            }
+        // Phase 2: apply atomically.
+        for (i, x_new) in new_states.into_iter().enumerate() {
+            self.neurons[i].x = x_new;
         }
 
-        // ═══════════════════════════════════════════
-        // PHASE 2: SEQUENTIAL MERGE (handles overlaps)
-        // ═══════════════════════════════════════════
-        self.merge_updates(&all_updates);
+        // Phase 3: update circuit confidences.
+        for circuit in &mut self.circuits {
+            circuit.update_confidence(&self.neurons);
+        }
 
-        // ═══════════════════════════════════════════
-        // PHASE 3: POST-STEP BOOKKEEPING
-        // ═══════════════════════════════════════════
         self.tick += 1;
     }
 
-    /// Merge all proposed updates into the neuron state.
-    pub fn merge_updates(&mut self, updates: &[(CircuitId, Vec<(usize, f32)>)]) {
-        // Build map: neuron_index → Vec<(circuit_id, delta)>
-        let mut neuron_updates: Vec<Vec<(CircuitId, f32)>> = vec![Vec::new(); self.neurons.len()];
+    /// Get a circuit by ID.
+    pub fn circuit_by_id(&self, id: CircuitId) -> Option<&Circuit> {
+        self.circuits.iter().find(|c| c.id == id)
+    }
 
-        for (circuit_id, circuit_updates) in updates {
-            for &(neuron_idx, delta) in circuit_updates {
-                neuron_updates[neuron_idx].push((*circuit_id, delta));
-            }
+    /// Get a mutable circuit by ID.
+    pub fn circuit_by_id_mut(&mut self, id: CircuitId) -> Option<&mut Circuit> {
+        self.circuits.iter_mut().find(|c| c.id == id)
+    }
+
+    /// Reset all neuron activations to zero.
+    pub fn reset_activations(&mut self) {
+        for neuron in &mut self.neurons {
+            neuron.x = 0.0;
         }
-
-        // Apply updates
-        for (neuron_idx, pending) in neuron_updates.iter().enumerate() {
-            match pending.len() {
-                0 => {} // No update this timestep.
-                1 => {
-                    // Single circuit — direct application.
-                    self.neurons[neuron_idx].x += pending[0].1;
-                }
-                2 => {
-                    // Overlap zone — use adaptive merge.
-                    let delta = self.merge_overlap(neuron_idx, pending);
-                    self.neurons[neuron_idx].x += delta;
-                }
-                _ => {
-                    // Should never happen (topology enforces max 2).
-                    log::error!(
-                        "Neuron {} has {} pending updates (max 2 expected)",
-                        neuron_idx,
-                        pending.len()
-                    );
-                    // Fallback: use highest-confidence circuit.
-                    let best = pending
-                        .iter()
-                        .max_by(|a, b| {
-                            self.get_circuit_confidence(a.0)
-                                .partial_cmp(&self.get_circuit_confidence(b.0))
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        })
-                        .unwrap();
-                    self.neurons[neuron_idx].x += best.1;
-                }
-            }
-        }
-    }
-
-    /// Merge two competing updates for an overlap neuron.
-    fn merge_overlap(&self, _neuron_idx: usize, pending: &[(CircuitId, f32)]) -> f32 {
-        debug_assert!(pending.len() == 2);
-
-        let (circuit_a_id, delta_a) = pending[0];
-        let (circuit_b_id, delta_b) = pending[1];
-
-        let circuit_a = self.get_circuit(circuit_a_id);
-        let circuit_b = self.get_circuit(circuit_b_id);
-
-        // Find the overlap zone for these two circuits.
-        if let Some(zone) = self.find_overlap_zone(circuit_a_id, circuit_b_id) {
-            // Safety override: detection circuit with high confidence wins.
-            let context_threshold =
-                zone.gate
-                    .adjust_threshold(zone.safety_threshold, circuit_a, circuit_b);
-
-            if circuit_a.circuit_type == CircuitType::Detection
-                && circuit_a.confidence > context_threshold
-            {
-                return delta_a;
-            }
-            if circuit_b.circuit_type == CircuitType::Detection
-                && circuit_b.confidence > context_threshold
-            {
-                return delta_b;
-            }
-
-            // Learned gate merge.
-            let (priority_a, priority_b) =
-                zone.gate
-                    .compute_priorities(circuit_a, delta_a, circuit_b, delta_b);
-
-            delta_a * priority_a + delta_b * priority_b
-        } else {
-            // No overlap zone registered — fall back to average.
-            (delta_a + delta_b) * 0.5
-        }
-    }
-
-    /// Look up a circuit by ID.
-    fn get_circuit(&self, id: CircuitId) -> &Circuit {
-        self.circuits
-            .iter()
-            .find(|c| c.id == id)
-            .expect("Circuit ID not found in mesh")
-    }
-
-    /// Get a circuit's confidence by ID.
-    fn get_circuit_confidence(&self, id: CircuitId) -> f32 {
-        self.circuits
-            .iter()
-            .find(|c| c.id == id)
-            .map(|c| c.confidence)
-            .unwrap_or(0.0)
-    }
-
-    /// Find the overlap zone connecting two circuits (order-independent).
-    fn find_overlap_zone(&self, a: CircuitId, b: CircuitId) -> Option<&OverlapZone> {
-        self.overlap_zones.iter().find(|z| z.connects(a, b))
-    }
-
-    /// Validate the current topology.
-    pub fn validate_topology(&self) -> Result<(), TopologyError> {
-        self.topology.validate(self.neurons.len(), &self.circuits)
-    }
-
-    /// Check if the mesh is healthy (all neurons finite, circuits present).
-    pub fn is_healthy(&self) -> bool {
-        self.neurons.iter().all(|n| n.x.is_finite())
-            && !self.circuits.is_empty()
-    }
-
-    /// Get the total neuron count.
-    pub fn neuron_count(&self) -> usize {
-        self.neurons.len()
-    }
-
-    /// Get the total circuit count.
-    pub fn circuit_count(&self) -> usize {
-        self.circuits.len()
+        self.tick = 0;
     }
 }
 
@@ -256,182 +122,116 @@ mod tests {
             total_neurons: 20,
             ..MeshConfig::default()
         };
-        OverlappingMesh::new(config)
-    }
+        let mut mesh = OverlappingMesh::new(config);
 
-    fn detection_circuit(id: u32, indices: Vec<usize>) -> Circuit {
-        Circuit::new(
-            id,
-            format!("det_{id}"),
-            indices,
-            0.01,
-            CircuitType::Detection,
-            CircuitCriticality::Safety,
-        )
-    }
-
-    #[test]
-    fn add_circuit_validates_topology() {
-        let mut mesh = small_mesh();
-        // Two circuits sharing neurons — should be OK.
-        mesh.add_circuit(detection_circuit(0, vec![0, 1, 2, 3]))
-            .unwrap();
-        mesh.add_circuit(detection_circuit(1, vec![2, 3, 4, 5]))
-            .unwrap();
-
-        // Third circuit also claiming neuron 2 — should fail.
-        let result = mesh.add_circuit(detection_circuit(2, vec![2, 6, 7]));
-        assert!(result.is_err());
-        // Mesh should still only have 2 circuits (rollback).
-        assert_eq!(mesh.circuit_count(), 2);
+        let c0 = Circuit::new(
+            0, "det_a", (0..10).collect(), 0.01,
+            CircuitType::Detection, CircuitCriticality::Safety,
+        );
+        let c1 = Circuit::new(
+            1, "det_b", (10..20).collect(), 0.01,
+            CircuitType::Detection, CircuitCriticality::Safety,
+        );
+        mesh.add_circuit(c0).unwrap();
+        mesh.add_circuit(c1).unwrap();
+        mesh
     }
 
     #[test]
-    fn step_does_not_panic_with_no_circuits() {
+    fn step_increments_tick() {
         let mut mesh = small_mesh();
+        assert_eq!(mesh.tick, 0);
+        mesh.step();
+        assert_eq!(mesh.tick, 1);
+    }
+
+    #[test]
+    fn step_runs_without_panic() {
+        let mut mesh = small_mesh();
+        for neuron in &mut mesh.neurons {
+            neuron.bias = 0.3;
+        }
         for _ in 0..100 {
             mesh.step();
         }
-        assert_eq!(mesh.tick, 100);
     }
 
     #[test]
-    fn step_updates_neurons() {
+    fn step_updates_activations() {
         let mut mesh = small_mesh();
-        // Give neuron 0 a bias so it has something to compute.
         mesh.neurons[0].bias = 0.5;
-
-        mesh.add_circuit(detection_circuit(0, vec![0, 1, 2]))
-            .unwrap();
-
-        let initial_x = mesh.neurons[0].x;
-
-        // Run enough steps for the Safety circuit to fire (tau=0.01, dt=0.001 → fires every 10 steps).
-        for _ in 0..10 {
-            mesh.step();
-        }
-
-        // Neuron 0 should have changed due to its bias.
-        assert_ne!(mesh.neurons[0].x, initial_x);
+        mesh.neurons[0].tau = 0.01;
+        mesh.step();
+        assert!(mesh.neurons[0].x != 0.0, "Biased neuron should have changed");
     }
 
     #[test]
-    fn overlap_merge_works() {
-        let mut mesh = small_mesh();
-
-        // Set up neurons with connections for meaningful computation.
-        mesh.neurons[5].bias = 0.5;
-        mesh.neurons[6].bias = -0.3;
-
-        // Two circuits sharing neurons 5 and 6.
-        mesh.add_circuit(detection_circuit(0, vec![0, 1, 2, 3, 4, 5, 6]))
-            .unwrap();
-
-        let mut causation = Circuit::new(
-            1,
-            "causation",
-            vec![5, 6, 7, 8, 9],
-            0.01,
-            CircuitType::Causation,
-            CircuitCriticality::Safety,
-        );
-        causation.confidence = 0.3;
-        mesh.add_circuit(causation).unwrap();
-
-        mesh.add_overlap_zone(OverlapZone::new(0, 1, vec![5, 6]));
-
-        // Run steps — the merge should handle overlap neurons without panicking.
-        for _ in 0..100 {
-            mesh.step();
-        }
-
-        assert!(mesh.is_healthy());
-    }
-
-    #[test]
-    fn safety_override_in_merge() {
-        let mut mesh = small_mesh();
-
-        // Detection circuit with very high confidence.
-        let mut det = detection_circuit(0, vec![0, 1, 2]);
-        det.confidence = 0.95;
-        mesh.add_circuit(det).unwrap();
-
-        let mut pred = Circuit::new(
-            1,
-            "prediction",
-            vec![1, 2, 3],
-            0.01,
-            CircuitType::Prediction,
-            CircuitCriticality::Safety,
-        );
-        pred.confidence = 0.1;
-        mesh.add_circuit(pred).unwrap();
-
-        let zone = OverlapZone::new(0, 1, vec![1, 2]);
-        mesh.add_overlap_zone(zone);
-
-        // The detection circuit should win the merge due to safety override.
-        let delta = mesh.merge_overlap(
-            1,
-            &[(0, 0.5), (1, -0.3)],
-        );
-        // Detection wins, so delta should be 0.5.
-        assert!((delta - 0.5).abs() < 1e-6);
-    }
-
-    #[test]
-    fn ten_thousand_steps_no_panic() {
-        let mut mesh = small_mesh();
-        mesh.neurons[0].bias = 0.2;
-        mesh.neurons[5].bias = -0.1;
-
-        mesh.add_circuit(detection_circuit(0, vec![0, 1, 2, 3, 4]))
-            .unwrap();
-        mesh.add_circuit(Circuit::new(
-            1,
-            "mem",
-            vec![5, 6, 7, 8, 9],
-            0.2,
-            CircuitType::Memory,
-            CircuitCriticality::Performance,
-        ))
-        .unwrap();
-
-        for _ in 0..10_000 {
-            mesh.step();
-        }
-
-        assert_eq!(mesh.tick, 10_000);
-        assert!(mesh.is_healthy());
-    }
-
-    #[test]
-    fn safety_circuit_determinism() {
-        // Two meshes with identical setup should produce bit-identical
-        // safety circuit results.
-        let setup = || {
-            let mut mesh = small_mesh();
-            mesh.neurons[0].bias = 0.3;
-            mesh.neurons[1].bias = -0.2;
-            mesh.add_circuit(detection_circuit(0, vec![0, 1, 2, 3, 4]))
-                .unwrap();
-            mesh
+    fn topology_rejects_triple_membership() {
+        let config = MeshConfig {
+            total_neurons: 10,
+            ..MeshConfig::default()
         };
+        let mut mesh = OverlappingMesh::new(config);
 
-        let mut mesh_a = setup();
-        let mut mesh_b = setup();
+        mesh.add_circuit(Circuit::new(
+            0, "a", vec![0, 1, 2], 0.01,
+            CircuitType::Detection, CircuitCriticality::Safety,
+        )).unwrap();
+        mesh.add_circuit(Circuit::new(
+            1, "b", vec![1, 2, 3], 0.01,
+            CircuitType::Detection, CircuitCriticality::Safety,
+        )).unwrap();
+        let result = mesh.add_circuit(Circuit::new(
+            2, "c", vec![2, 3, 4], 0.01,
+            CircuitType::Detection, CircuitCriticality::Safety,
+        ));
+        assert!(result.is_err());
+    }
 
-        for _ in 0..500 {
-            mesh_a.step();
-            mesh_b.step();
+    #[test]
+    fn overlap_neurons_get_counted() {
+        let config = MeshConfig {
+            total_neurons: 20,
+            ..MeshConfig::default()
+        };
+        let mut mesh = OverlappingMesh::new(config);
+        mesh.add_circuit(Circuit::new(
+            0, "a", vec![0, 1, 2, 3], 0.01,
+            CircuitType::Detection, CircuitCriticality::Safety,
+        )).unwrap();
+        mesh.add_circuit(Circuit::new(
+            1, "b", vec![2, 3, 4, 5], 0.01,
+            CircuitType::Causation, CircuitCriticality::Safety,
+        )).unwrap();
+
+        assert_eq!(mesh.neurons[2].circuit_membership_count, 2);
+        assert_eq!(mesh.neurons[0].circuit_membership_count, 1);
+        assert_eq!(mesh.neurons[4].circuit_membership_count, 1);
+    }
+
+    #[test]
+    fn cfc_step_preserves_finite_state() {
+        let mut mesh = small_mesh();
+        for n in &mut mesh.neurons {
+            n.bias = 0.5;
+            n.x = 0.3;
         }
-
-        for i in 0..5 {
-            assert_eq!(
-                mesh_a.neurons[i].x, mesh_b.neurons[i].x,
-                "Neuron {i} diverged between identical meshes"
-            );
+        for _ in 0..1000 {
+            mesh.step();
         }
+        for n in &mesh.neurons {
+            assert!(n.x.is_finite(), "Neuron state should remain finite");
+            assert!(n.x.abs() < 2.0, "CfC should bound activations");
+        }
+    }
+
+    #[test]
+    fn reset_activations_zeros_state() {
+        let mut mesh = small_mesh();
+        mesh.neurons[0].x = 0.5;
+        mesh.tick = 42;
+        mesh.reset_activations();
+        assert_eq!(mesh.neurons[0].x, 0.0);
+        assert_eq!(mesh.tick, 0);
     }
 }

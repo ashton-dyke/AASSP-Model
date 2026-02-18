@@ -1,6 +1,6 @@
 //! Training pipeline for the AASSP neural mesh.
 //!
-//! Implements manual BPTT (backpropagation through time) for liquid neuron
+//! Implements manual BPTT (backpropagation through time) for LTC/CfC neuron
 //! dynamics, three-stage offline training, and online adapter learning.
 
 pub mod backward;

@@ -3,7 +3,7 @@
 use crate::adaptation::adapter::AdapterLayer;
 use crate::adaptation::replay::ReplayBuffer;
 use crate::circuit::Circuit;
-use crate::config::{DegradationMode, ExecutionMode, MeshConfig};
+use crate::config::{DegradationMode, MeshConfig};
 use crate::io::encoding::Baselines;
 use crate::io::output::MeshOutput;
 use crate::io::wits::WitsSnapshot;
@@ -29,30 +29,21 @@ pub struct ProductionMesh {
     pub replay_buffer: ReplayBuffer,
     pub episodic_store: EpisodicMemory,
     pub baselines: Baselines,
-
-    // ═══ EXECUTION STATE ═══
-    pub execution_mode: ExecutionMode,
 }
 
 impl ProductionMesh {
     /// Create a new production mesh with default configuration.
     pub fn new(config: MeshConfig) -> Self {
         let neuron_count = config.total_neurons;
-        let replay_size = config.replay_buffer_size;
-        let replay_frac = config.replay_fraction;
-        let episodic_max = config.episodic_max_episodes;
-        let episodic_thresh = config.episodic_store_threshold;
-        let mode = config.initial_mode;
 
         Self {
             universal_mesh: OverlappingMesh::new(config),
             formation_adapter: AdapterLayer::new(64, Vec::new(), Vec::new()),
             well_adapter: AdapterLayer::new(64, Vec::new(), Vec::new()),
             adaptive_circuits: Vec::new(),
-            replay_buffer: ReplayBuffer::new(replay_size, replay_frac),
-            episodic_store: EpisodicMemory::new(neuron_count, episodic_max, episodic_thresh),
+            replay_buffer: ReplayBuffer::new(1000, 0.1),
+            episodic_store: EpisodicMemory::new(neuron_count, 500, 0.85),
             baselines: Baselines::new(),
-            execution_mode: mode,
         }
     }
 
@@ -77,16 +68,15 @@ impl ProductionMesh {
 
     /// Check system health and determine degradation mode.
     pub fn health_check(&self) -> DegradationMode {
-        if !self.universal_mesh.is_healthy() {
-            return DegradationMode::PhysicsOnly;
+        // Check for NaN/Inf in neurons.
+        let all_finite = self.universal_mesh.neurons.iter().all(|n| n.x.is_finite());
+        if !all_finite {
+            return DegradationMode::Minimal;
         }
 
-        if !self.episodic_store.is_healthy() {
-            return DegradationMode::NoMemory;
-        }
-
+        // Check if all circuit types are present.
         if !self.all_circuit_types_active() {
-            return DegradationMode::DetectionOnly;
+            return DegradationMode::Degraded;
         }
 
         DegradationMode::Full
@@ -121,20 +111,18 @@ mod tests {
         let config = MeshConfig::default();
         let mesh = ProductionMesh::new(config);
 
-        assert_eq!(mesh.universal_mesh.neuron_count(), 4_736);
+        assert_eq!(mesh.universal_mesh.neurons.len(), 4_736);
         assert_eq!(mesh.formation_adapter.neurons.len(), 64);
         assert_eq!(mesh.well_adapter.neurons.len(), 64);
-        assert_eq!(mesh.execution_mode, ExecutionMode::Shadow);
     }
 
     #[test]
-    fn health_check_physics_only_when_unhealthy() {
+    fn health_check_minimal_when_nan() {
         let config = MeshConfig::default();
         let mut mesh = ProductionMesh::new(config);
 
-        // Corrupt a neuron.
         mesh.universal_mesh.neurons[0].x = f32::NAN;
-        assert_eq!(mesh.health_check(), DegradationMode::PhysicsOnly);
+        assert_eq!(mesh.health_check(), DegradationMode::Minimal);
     }
 
     #[test]
@@ -148,7 +136,7 @@ mod tests {
         let wits = WitsSnapshot::zeros();
 
         let output = mesh.process(&wits);
-        // With no circuits, is_healthy() returns false → PhysicsOnly.
-        assert_eq!(output.mode, DegradationMode::PhysicsOnly);
+        // With no circuits, not all_circuit_types_active() → Degraded.
+        assert_eq!(output.mode, DegradationMode::Degraded);
     }
 }

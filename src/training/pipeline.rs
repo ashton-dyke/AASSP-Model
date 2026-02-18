@@ -1,7 +1,12 @@
 //! Training pipeline: orchestrates the three-stage offline training process.
+//!
+//! With LTC/CfC neurons, every neuron updates synchronously at every step.
+//! The forward pass uses cfc_forward to produce CfcIntermediate values
+//! needed for analytical backpropagation.
 
 use crate::io::encoding::{encode_input, Baselines};
 use crate::mesh::OverlappingMesh;
+use crate::neuron::cfc_forward;
 use crate::training::backward::backprop_through_time;
 use crate::training::data::{causation_labels_for_sample, detection_labels_for_sample};
 use crate::training::init::initialize_connections;
@@ -136,7 +141,9 @@ pub struct TrainingMetrics {
 }
 
 /// Run a single forward pass through the mesh for one WITS sample,
-/// recording state for BPTT.
+/// recording CfcIntermediate state for BPTT.
+///
+/// All neurons update synchronously at every step (no firing logic).
 pub fn recorded_forward_pass(
     mesh: &mut OverlappingMesh,
     record: &mut ForwardRecord,
@@ -147,45 +154,24 @@ pub fn recorded_forward_pass(
     for _ in 0..steps {
         record.begin_step();
 
-        // Determine which circuits fire this step.
-        let rng = mesh.rng.get_or_insert_with(|| StdRng::seed_from_u64(42));
-        let mut firing_circuits: Vec<(u32, usize)> = Vec::new(); // (id, idx)
-        for (ci, circuit) in mesh.circuits.iter_mut().enumerate() {
-            if circuit.should_fire(dt, rng) {
-                firing_circuits.push((circuit.id, ci));
-                record.record_firing(circuit.id);
-            }
+        // Phase 1: Compute all new states and record intermediates.
+        let mut new_states = Vec::with_capacity(mesh.neurons.len());
+        for neuron_idx in 0..mesh.neurons.len() {
+            let (x_new, inter) = cfc_forward(&mesh.neurons[neuron_idx], &mesh.neurons, dt);
+            record.record_neuron(neuron_idx, inter);
+            new_states.push(x_new);
         }
 
-        // Compute updates and record state.
-        let mut all_updates: Vec<(u32, Vec<(usize, f32)>)> = Vec::new();
-
-        for &(circuit_id, ci) in &firing_circuits {
-            let tau = mesh.circuits[ci].tau;
-            let mut updates = Vec::new();
-
-            for &neuron_idx in &mesh.circuits[ci].neuron_indices {
-                let neuron = &mesh.neurons[neuron_idx];
-                let input_sum: f32 = neuron
-                    .connections
-                    .iter()
-                    .map(|&(src, w)| mesh.neurons[src].x * w)
-                    .sum::<f32>()
-                    + neuron.bias;
-
-                // Record before update.
-                record.record_neuron(neuron_idx, neuron.x, input_sum, circuit_id, tau);
-
-                let dx = (-neuron.x + input_sum.tanh()) / tau * dt;
-                updates.push((neuron_idx, dx));
-            }
-
-            mesh.circuits[ci].update_confidence(&mesh.neurons);
-            all_updates.push((circuit_id, updates));
+        // Phase 2: Apply new states atomically.
+        for (i, x_new) in new_states.into_iter().enumerate() {
+            mesh.neurons[i].x = x_new;
         }
 
-        // Merge updates (same as mesh.merge_updates but we own the data).
-        mesh.merge_updates(&all_updates);
+        // Phase 3: Update circuit confidences.
+        for circuit in &mut mesh.circuits {
+            circuit.update_confidence(&mesh.neurons);
+        }
+
         mesh.tick += 1;
     }
 }
@@ -205,18 +191,24 @@ fn run_stage1(
     let mut rng = StdRng::seed_from_u64(config.seed);
     let warmup_steps = (config.stage1_steps as f32 * config.lr_warmup_fraction) as u32;
 
-    // In Stage 1, all neuron weights are frozen — only gates/masks train.
+    // In Stage 1, all neuron weights are frozen -- only gates/masks train.
     let all_circuit_ids: Vec<u32> = mesh.circuits.iter().map(|c| c.id).collect();
 
     for step in 0..config.stage1_steps {
-        optimizer.set_lr(cosine_lr(config.stage1_lr, step, config.stage1_steps, warmup_steps));
+        optimizer.set_lr(cosine_lr(
+            config.stage1_lr,
+            step,
+            config.stage1_steps,
+            warmup_steps,
+        ));
 
         let mut accum_grads = GradientAccumulator::from_mesh(mesh);
         let mut step_loss = 0.0;
 
         for micro in 0..config.mini_batch_size {
             let seq_idx = rand::Rng::gen_range(&mut rng, 0..dataset.len());
-            let sample_idx = rand::Rng::gen_range(&mut rng, 0..dataset[seq_idx].wits_samples.len());
+            let sample_idx =
+                rand::Rng::gen_range(&mut rng, 0..dataset[seq_idx].wits_samples.len());
             let wits = &dataset[seq_idx].wits_samples[sample_idx];
 
             encode_input(mesh, wits, baselines);
@@ -234,8 +226,7 @@ fn run_stage1(
 
                 for (i, &mask) in mesh.overlap_zones[zone_idx].masks.iter().enumerate() {
                     if zone_idx < grads.mask_grads.len() && i < grads.mask_grads[zone_idx].len() {
-                        grads.mask_grads[zone_idx][i] +=
-                            config.sparsity_lambda * mask.signum();
+                        grads.mask_grads[zone_idx][i] += config.sparsity_lambda * mask.signum();
                     }
                 }
 
@@ -300,10 +291,26 @@ fn run_stage2(
         .collect();
 
     let all_ids: Vec<u32> = mesh.circuits.iter().map(|c| c.id).collect();
-    let freeze_except_causation: Vec<u32> = all_ids.iter().filter(|id| !causation_ids.contains(id)).cloned().collect();
-    let freeze_except_detection: Vec<u32> = all_ids.iter().filter(|id| !detection_ids.contains(id)).cloned().collect();
-    let freeze_except_memory: Vec<u32> = all_ids.iter().filter(|id| !memory_ids.contains(id)).cloned().collect();
-    let freeze_except_prediction: Vec<u32> = all_ids.iter().filter(|id| !prediction_ids.contains(id)).cloned().collect();
+    let freeze_except_causation: Vec<u32> = all_ids
+        .iter()
+        .filter(|id| !causation_ids.contains(id))
+        .cloned()
+        .collect();
+    let freeze_except_detection: Vec<u32> = all_ids
+        .iter()
+        .filter(|id| !detection_ids.contains(id))
+        .cloned()
+        .collect();
+    let freeze_except_memory: Vec<u32> = all_ids
+        .iter()
+        .filter(|id| !memory_ids.contains(id))
+        .cloned()
+        .collect();
+    let freeze_except_prediction: Vec<u32> = all_ids
+        .iter()
+        .filter(|id| !prediction_ids.contains(id))
+        .cloned()
+        .collect();
 
     let mut rng = StdRng::seed_from_u64(config.seed + 1);
     let mut replay_buffer = ReplayBuffer::new(config.replay_buffer_size);
@@ -416,7 +423,10 @@ fn train_circuit_group(
             let seq = &dataset[seq_idx];
             encode_input(mesh, &seq.wits_samples[sample_idx], baselines);
 
-            let mut record = ForwardRecord::new(mesh.neurons.len(), config.mesh_steps_per_sample as usize);
+            let mut record = ForwardRecord::new(
+                mesh.neurons.len(),
+                config.mesh_steps_per_sample as usize,
+            );
             recorded_forward_pass(mesh, &mut record, config.mesh_steps_per_sample);
 
             let det_labels = detection_labels_for_sample(seq, sample_idx);
@@ -471,7 +481,12 @@ fn run_stage3(
     let warmup_steps = (config.stage3_steps as f32 * config.lr_warmup_fraction) as u32;
 
     for step in 0..config.stage3_steps {
-        optimizer.set_lr(cosine_lr(config.stage3_lr, step, config.stage3_steps, warmup_steps));
+        optimizer.set_lr(cosine_lr(
+            config.stage3_lr,
+            step,
+            config.stage3_steps,
+            warmup_steps,
+        ));
 
         let mut accum_grads = GradientAccumulator::from_mesh(mesh);
         let mut step_loss = 0.0;
@@ -483,7 +498,10 @@ fn run_stage3(
 
             encode_input(mesh, &seq.wits_samples[sample_idx], baselines);
 
-            let mut record = ForwardRecord::new(mesh.neurons.len(), config.mesh_steps_per_sample as usize);
+            let mut record = ForwardRecord::new(
+                mesh.neurons.len(),
+                config.mesh_steps_per_sample as usize,
+            );
             recorded_forward_pass(mesh, &mut record, config.mesh_steps_per_sample);
 
             let det_labels = detection_labels_for_sample(seq, sample_idx);
@@ -507,13 +525,12 @@ fn run_stage3(
                 }
                 for (i, &mask) in zone.masks.iter().enumerate() {
                     if i < grads.mask_grads[zone_idx].len() && i < mask_refs[zone_idx].len() {
-                        grads.mask_grads[zone_idx][i] +=
-                            config.sparsity_lambda * mask.signum()
-                                + crate::training::backward::backprop_stability(
-                                    mask,
-                                    mask_refs[zone_idx][i],
-                                    config.stability_lambda,
-                                );
+                        grads.mask_grads[zone_idx][i] += config.sparsity_lambda * mask.signum()
+                            + crate::training::backward::backprop_stability(
+                                mask,
+                                mask_refs[zone_idx][i],
+                                config.stability_lambda,
+                            );
                     }
                 }
             }
@@ -532,7 +549,8 @@ fn run_stage3(
         if step % 100 == 0 {
             let stab = loss::stability_loss(mesh, mask_refs);
             let sparse = loss::total_sparsity_loss(mesh);
-            let total = step_loss + config.stability_lambda * stab + config.sparsity_lambda * sparse;
+            let total =
+                step_loss + config.stability_lambda * stab + config.sparsity_lambda * sparse;
             metrics.stage3_losses.push(total);
         }
     }
@@ -579,7 +597,11 @@ pub fn evaluate_detection_accuracy(
         }
     }
 
-    if total == 0 { 0.0 } else { correct as f32 / total as f32 }
+    if total == 0 {
+        0.0
+    } else {
+        correct as f32 / total as f32
+    }
 }
 
 /// Post-training: prune masks, freeze circuits, validate.
@@ -619,7 +641,7 @@ pub fn run_full_training(
 ) -> TrainingMetrics {
     let mut metrics = TrainingMetrics::default();
 
-    // Step 0: Initialize connections.
+    // Step 0: Initialize connections (including gate weights and tau).
     initialize_connections(mesh, config.seed);
 
     // Generate synthetic training data.
@@ -648,14 +670,26 @@ pub fn run_full_training(
     run_stage2(mesh, config, &dataset, &baselines, &mut metrics);
 
     // Stage 3: Joint fine-tuning.
-    run_stage3(mesh, config, &dataset, &baselines, &mask_refs, &mut metrics);
+    run_stage3(
+        mesh,
+        config,
+        &dataset,
+        &baselines,
+        &mask_refs,
+        &mut metrics,
+    );
 
     // Post-training freeze.
-    post_training_freeze(mesh, mesh.config.mask_prune_threshold);
+    post_training_freeze(mesh, mesh.config.overlap_prune_threshold);
 
     // Evaluate final detection accuracy.
-    metrics.final_detection_accuracy =
-        evaluate_detection_accuracy(mesh, &dataset, &baselines, config.mesh_steps_per_sample, 100);
+    metrics.final_detection_accuracy = evaluate_detection_accuracy(
+        mesh,
+        &dataset,
+        &baselines,
+        config.mesh_steps_per_sample,
+        100,
+    );
 
     metrics
 }
@@ -679,12 +713,14 @@ mod tests {
         recorded_forward_pass(&mut mesh, &mut record, 20);
 
         assert_eq!(record.step_count, 20);
-        // At least some neurons should have snapshots across all steps.
-        let has_snapshots = record
-            .step_snapshots
-            .iter()
-            .any(|step| step.iter().any(|s| s.is_some()));
-        assert!(has_snapshots, "No neuron snapshots recorded in any step");
+        // Every neuron should have CfcIntermediate at every step (synchronous update).
+        // Check that intermediates have non-default x_prev after some steps.
+        let last_step = &record.step_intermediates[19];
+        let has_nonzero = last_step.iter().any(|inter| inter.x_prev.abs() > 1e-12);
+        assert!(
+            has_nonzero,
+            "Some neurons should have non-zero x_prev in last step"
+        );
     }
 
     #[test]
@@ -814,7 +850,7 @@ mod tests {
         // Baseline: mini_batch_size=1, no weight decay, no LR schedule, no replay.
         // Improved: mini_batch_size=4, weight decay, cosine LR, replay buffer.
         // Both use the same number of optimizer steps so "improved" does 4x more
-        // forward passes — that's the tradeoff: cleaner gradients for more compute.
+        // forward passes -- that's the tradeoff: cleaner gradients for more compute.
 
         let shared = TrainingConfig {
             stage1_steps: 30,
@@ -863,7 +899,8 @@ mod tests {
             }
             let diffs: Vec<f32> = losses.windows(2).map(|w| (w[1] - w[0]).abs()).collect();
             let mean = diffs.iter().sum::<f32>() / diffs.len() as f32;
-            let var = diffs.iter().map(|d| (d - mean).powi(2)).sum::<f32>() / diffs.len() as f32;
+            let var =
+                diffs.iter().map(|d| (d - mean).powi(2)).sum::<f32>() / diffs.len() as f32;
             var.sqrt()
         }
 
@@ -874,59 +911,111 @@ mod tests {
 
         eprintln!("\n=== TRAINING COMPARISON ===");
         eprintln!("                         Baseline    Improved");
-        eprintln!("Stage 2 det losses:      {}          {}",
+        eprintln!(
+            "Stage 2 det losses:      {}          {}",
             baseline_metrics.stage2_detection_losses.len(),
-            improved_metrics.stage2_detection_losses.len());
-        eprintln!("Stage 2 volatility:      {:.4}      {:.4}", baseline_s2_vol, improved_s2_vol);
-        eprintln!("Stage 3 losses:          {}          {}",
+            improved_metrics.stage2_detection_losses.len()
+        );
+        eprintln!(
+            "Stage 2 volatility:      {:.4}      {:.4}",
+            baseline_s2_vol, improved_s2_vol
+        );
+        eprintln!(
+            "Stage 3 losses:          {}          {}",
             baseline_metrics.stage3_losses.len(),
-            improved_metrics.stage3_losses.len());
-        eprintln!("Stage 3 volatility:      {:.4}      {:.4}", baseline_s3_vol, improved_s3_vol);
-        eprintln!("Detection accuracy:      {:.1}%       {:.1}%",
+            improved_metrics.stage3_losses.len()
+        );
+        eprintln!(
+            "Stage 3 volatility:      {:.4}      {:.4}",
+            baseline_s3_vol, improved_s3_vol
+        );
+        eprintln!(
+            "Detection accuracy:      {:.1}%       {:.1}%",
             baseline_metrics.final_detection_accuracy * 100.0,
-            improved_metrics.final_detection_accuracy * 100.0);
+            improved_metrics.final_detection_accuracy * 100.0
+        );
 
-        if !baseline_metrics.stage3_losses.is_empty() && !improved_metrics.stage3_losses.is_empty() {
+        if !baseline_metrics.stage3_losses.is_empty() && !improved_metrics.stage3_losses.is_empty()
+        {
             let bl_final = baseline_metrics.stage3_losses.last().unwrap();
             let im_final = improved_metrics.stage3_losses.last().unwrap();
-            eprintln!("Stage 3 final loss:      {:.4}      {:.4}", bl_final, im_final);
+            eprintln!(
+                "Stage 3 final loss:      {:.4}      {:.4}",
+                bl_final, im_final
+            );
         }
 
         // Print full loss trajectories for detailed analysis.
         if !baseline_metrics.stage2_detection_losses.is_empty() {
             eprintln!("\n--- Stage 2 Detection Loss Trajectory ---");
-            eprintln!("Baseline: {:?}",
-                baseline_metrics.stage2_detection_losses.iter()
-                    .map(|l| format!("{:.3}", l)).collect::<Vec<_>>());
-            eprintln!("Improved: {:?}",
-                improved_metrics.stage2_detection_losses.iter()
-                    .map(|l| format!("{:.3}", l)).collect::<Vec<_>>());
+            eprintln!(
+                "Baseline: {:?}",
+                baseline_metrics
+                    .stage2_detection_losses
+                    .iter()
+                    .map(|l| format!("{:.3}", l))
+                    .collect::<Vec<_>>()
+            );
+            eprintln!(
+                "Improved: {:?}",
+                improved_metrics
+                    .stage2_detection_losses
+                    .iter()
+                    .map(|l| format!("{:.3}", l))
+                    .collect::<Vec<_>>()
+            );
         }
         if !baseline_metrics.stage3_losses.is_empty() {
             eprintln!("\n--- Stage 3 Loss Trajectory ---");
-            eprintln!("Baseline: {:?}",
-                baseline_metrics.stage3_losses.iter()
-                    .map(|l| format!("{:.3}", l)).collect::<Vec<_>>());
-            eprintln!("Improved: {:?}",
-                improved_metrics.stage3_losses.iter()
-                    .map(|l| format!("{:.3}", l)).collect::<Vec<_>>());
+            eprintln!(
+                "Baseline: {:?}",
+                baseline_metrics
+                    .stage3_losses
+                    .iter()
+                    .map(|l| format!("{:.3}", l))
+                    .collect::<Vec<_>>()
+            );
+            eprintln!(
+                "Improved: {:?}",
+                improved_metrics
+                    .stage3_losses
+                    .iter()
+                    .map(|l| format!("{:.3}", l))
+                    .collect::<Vec<_>>()
+            );
         }
 
         eprintln!("\n--- Stage 2 Causation Loss Trajectory ---");
-        eprintln!("Baseline: {:?}",
-            baseline_metrics.stage2_causation_losses.iter()
-                .map(|l| format!("{:.3}", l)).collect::<Vec<_>>());
-        eprintln!("Improved: {:?}",
-            improved_metrics.stage2_causation_losses.iter()
-                .map(|l| format!("{:.3}", l)).collect::<Vec<_>>());
+        eprintln!(
+            "Baseline: {:?}",
+            baseline_metrics
+                .stage2_causation_losses
+                .iter()
+                .map(|l| format!("{:.3}", l))
+                .collect::<Vec<_>>()
+        );
+        eprintln!(
+            "Improved: {:?}",
+            improved_metrics
+                .stage2_causation_losses
+                .iter()
+                .map(|l| format!("{:.3}", l))
+                .collect::<Vec<_>>()
+        );
 
         // Assertions: both should produce valid results.
         assert!(
-            baseline_metrics.stage3_losses.iter().all(|l| l.is_finite()),
+            baseline_metrics
+                .stage3_losses
+                .iter()
+                .all(|l| l.is_finite()),
             "Baseline stage 3 losses should be finite"
         );
         assert!(
-            improved_metrics.stage3_losses.iter().all(|l| l.is_finite()),
+            improved_metrics
+                .stage3_losses
+                .iter()
+                .all(|l| l.is_finite()),
             "Improved stage 3 losses should be finite"
         );
         assert!(
@@ -945,12 +1034,16 @@ mod tests {
         let vol_improved = improved_s2_vol <= baseline_s2_vol * 1.1;
         let acc_improved = improved_metrics.final_detection_accuracy
             >= baseline_metrics.final_detection_accuracy - 0.05;
-        eprintln!("Volatility improved: {} (baseline={:.4}, improved={:.4})",
-            vol_improved, baseline_s2_vol, improved_s2_vol);
-        eprintln!("Accuracy maintained:  {} (baseline={:.1}%, improved={:.1}%)",
+        eprintln!(
+            "Volatility improved: {} (baseline={:.4}, improved={:.4})",
+            vol_improved, baseline_s2_vol, improved_s2_vol
+        );
+        eprintln!(
+            "Accuracy maintained:  {} (baseline={:.1}%, improved={:.1}%)",
             acc_improved,
             baseline_metrics.final_detection_accuracy * 100.0,
-            improved_metrics.final_detection_accuracy * 100.0);
+            improved_metrics.final_detection_accuracy * 100.0
+        );
     }
 
     #[test]
@@ -973,15 +1066,25 @@ mod tests {
         let mut mesh = build_default_mesh();
         let _metrics = run_full_training(&mut mesh, &config);
 
-        // Check that training ran.
-        assert!(mesh.is_healthy(), "Mesh should be healthy after training");
-
         // Check that circuits are frozen after training.
         let frozen_count = mesh.circuits.iter().filter(|c| c.frozen).count();
-        assert!(frozen_count > 0, "Some circuits should be frozen after training");
+        assert!(
+            frozen_count > 0,
+            "Some circuits should be frozen after training"
+        );
 
         // Neurons should have connections.
-        let connected = mesh.neurons.iter().filter(|n| !n.connections.is_empty()).count();
+        let connected = mesh
+            .neurons
+            .iter()
+            .filter(|n| !n.connections.is_empty())
+            .count();
         assert!(connected > 100, "Neurons should have connections: {connected}");
+
+        // All neuron states should be finite after training.
+        assert!(
+            mesh.neurons.iter().all(|n| n.x.is_finite()),
+            "All neuron states should be finite after training"
+        );
     }
 }

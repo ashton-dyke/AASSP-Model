@@ -1,7 +1,9 @@
 //! Connection initialization for the neural mesh.
 //!
-//! Before training, neurons need sparse random connectivity. This module
-//! creates structured connections with Xavier/Glorot initialization.
+//! Before training, LtcNeurons need sparse random connectivity for both
+//! drive and gate pathways. This module creates structured connections
+//! with Xavier/Glorot initialization, initializes gate weights, and sets
+//! per-neuron tau from the circuit's tau field with small random perturbation.
 
 use crate::circuit::CircuitType;
 use crate::mesh::OverlappingMesh;
@@ -23,7 +25,7 @@ fn target_density(circuit_type: CircuitType) -> f32 {
 /// Fraction of connections that should come from within the same circuit.
 fn local_fraction(circuit_type: CircuitType) -> f32 {
     match circuit_type {
-        CircuitType::Detection => 1.0,  // Detection is self-contained.
+        CircuitType::Detection => 1.0, // Detection is self-contained.
         CircuitType::Causation => 0.7,
         CircuitType::Memory => 0.7,
         CircuitType::Prediction => 0.7,
@@ -36,7 +38,10 @@ fn local_fraction(circuit_type: CircuitType) -> f32 {
 /// - A fraction from within the same circuit (local)
 /// - The remainder from any neuron in the mesh (global)
 ///
-/// Weights are initialized with Xavier/Glorot: N(0, sqrt(2 / (fan_in + fan_out))).
+/// Drive weights are initialized with Xavier/Glorot: N(0, sqrt(2 / (fan_in + fan_out))).
+/// Gate weights are initialized with Xavier/Glorot (same connectivity as drive).
+/// Gate bias is initialized to a small negative value (-0.5) to keep gates conservative.
+/// Per-neuron tau is set from the circuit's tau field with small random perturbation.
 pub fn initialize_connections(mesh: &mut OverlappingMesh, seed: u64) {
     let mut rng = StdRng::seed_from_u64(seed);
     let total_neurons = mesh.neurons.len();
@@ -52,6 +57,7 @@ pub fn initialize_connections(mesh: &mut OverlappingMesh, seed: u64) {
     // For each circuit, initialize its neurons' connections.
     for ci in 0..mesh.circuits.len() {
         let circuit_type = mesh.circuits[ci].circuit_type;
+        let circuit_tau = mesh.circuits[ci].tau;
         let circuit_indices: Vec<usize> = mesh.circuits[ci].neuron_indices.clone();
         let circuit_size = circuit_indices.len();
         let density = target_density(circuit_type);
@@ -75,6 +81,7 @@ pub fn initialize_connections(mesh: &mut OverlappingMesh, seed: u64) {
             }
 
             let mut connections = Vec::with_capacity(n_connections);
+            let mut gate_weights = Vec::with_capacity(n_connections);
             let mut used = HashSet::new();
             used.insert(neuron_idx); // No self-connections.
 
@@ -87,8 +94,10 @@ pub fn initialize_connections(mesh: &mut OverlappingMesh, seed: u64) {
                 }
                 let src = circuit_indices[rng.gen_range(0..circuit_size)];
                 if used.insert(src) {
-                    let weight = rng.gen::<f32>() * 2.0 * xavier_std - xavier_std;
-                    connections.push((src, weight));
+                    let drive_w = rng.gen::<f32>() * 2.0 * xavier_std - xavier_std;
+                    let gate_w = rng.gen::<f32>() * 2.0 * xavier_std - xavier_std;
+                    connections.push((src, drive_w));
+                    gate_weights.push(gate_w);
                     local_added += 1;
                 }
             }
@@ -101,20 +110,31 @@ pub fn initialize_connections(mesh: &mut OverlappingMesh, seed: u64) {
                 }
                 let src = rng.gen_range(0..total_neurons);
                 if used.insert(src) && !circuit_set.contains(&src) {
-                    let weight = rng.gen::<f32>() * 2.0 * xavier_std - xavier_std;
-                    connections.push((src, weight));
+                    let drive_w = rng.gen::<f32>() * 2.0 * xavier_std - xavier_std;
+                    let gate_w = rng.gen::<f32>() * 2.0 * xavier_std - xavier_std;
+                    connections.push((src, drive_w));
+                    gate_weights.push(gate_w);
                     global_added += 1;
                 }
             }
 
             mesh.neurons[neuron_idx].connections = connections;
+            mesh.neurons[neuron_idx].gate_weights = gate_weights;
+
+            // Set per-neuron tau from circuit tau with small random perturbation.
+            // Perturbation: multiply by (1 + uniform(-0.1, 0.1))
+            let perturbation = 1.0 + (rng.gen::<f32>() * 0.2 - 0.1);
+            mesh.neurons[neuron_idx].tau = (circuit_tau * perturbation).max(1e-4);
         }
     }
 
-    // Initialize biases with small random values.
+    // Initialize biases.
     for neuron in &mut mesh.neurons {
         if !neuron.connections.is_empty() {
+            // Drive bias: small random values.
             neuron.bias = rng.gen::<f32>() * 0.02 - 0.01;
+            // Gate bias: small negative value to keep gates initially conservative.
+            neuron.gate_bias = -0.5 + rng.gen::<f32>() * 0.1 - 0.05;
         }
     }
 }
@@ -246,10 +266,74 @@ mod tests {
             for &(_, w) in &neuron.connections {
                 assert!(
                     w.abs() < 1.0,
-                    "Xavier-initialized weight should be small, got {w}"
+                    "Xavier-initialized drive weight should be small, got {w}"
+                );
+            }
+            for &gw in &neuron.gate_weights {
+                assert!(
+                    gw.abs() < 1.0,
+                    "Xavier-initialized gate weight should be small, got {gw}"
                 );
             }
         }
+    }
+
+    #[test]
+    fn gate_weights_parallel_to_connections() {
+        let mut mesh = build_default_mesh();
+        initialize_connections(&mut mesh, 42);
+
+        for neuron in &mesh.neurons {
+            assert_eq!(
+                neuron.connections.len(),
+                neuron.gate_weights.len(),
+                "Gate weights should be parallel to connections"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_bias_initialized_negative() {
+        let mut mesh = build_default_mesh();
+        initialize_connections(&mut mesh, 42);
+
+        // Check that neurons with connections have negative gate bias.
+        let connected: Vec<_> = mesh
+            .neurons
+            .iter()
+            .filter(|n| !n.connections.is_empty())
+            .collect();
+        assert!(!connected.is_empty());
+
+        for neuron in &connected {
+            assert!(
+                neuron.gate_bias < 0.0,
+                "Gate bias should be negative for conservative initial gating, got {}",
+                neuron.gate_bias
+            );
+        }
+    }
+
+    #[test]
+    fn tau_set_from_circuit() {
+        let mut mesh = build_default_mesh();
+        initialize_connections(&mut mesh, 42);
+
+        // Detection neurons (circuit tau=0.01) should have tau near 0.01.
+        let det_neuron = &mesh.neurons[0];
+        assert!(
+            det_neuron.tau > 0.005 && det_neuron.tau < 0.015,
+            "Detection neuron tau should be near 0.01, got {}",
+            det_neuron.tau
+        );
+
+        // Causation neurons (circuit tau=0.05) should have tau near 0.05.
+        let caus_neuron = &mesh.neurons[1024];
+        assert!(
+            caus_neuron.tau > 0.03 && caus_neuron.tau < 0.07,
+            "Causation neuron tau should be near 0.05, got {}",
+            caus_neuron.tau
+        );
     }
 
     #[test]

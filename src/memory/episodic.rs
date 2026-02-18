@@ -3,7 +3,7 @@
 //! Lives OUTSIDE the neural mesh. Provides long-term memory across hours,
 //! days, and wells using brute-force KNN (HNSW can be plugged in later).
 
-use crate::neuron::LiquidNeuron;
+use crate::neuron::LtcNeuron;
 use serde::{Deserialize, Serialize};
 
 /// What the causation circuits concluded.
@@ -120,7 +120,7 @@ impl EpisodicMemory {
     /// Store a new episode if confidence exceeds threshold.
     pub fn maybe_store(
         &mut self,
-        neurons: &[LiquidNeuron],
+        neurons: &[LtcNeuron],
         tick: u64,
         diagnosis: DiagnosisType,
         confidence: f32,
@@ -158,7 +158,7 @@ impl EpisodicMemory {
     /// Find k most similar past episodes to the current neuron state.
     ///
     /// Uses cosine similarity on the dense state vectors.
-    pub fn recall_similar(&self, neurons: &[LiquidNeuron], k: usize) -> Vec<&Episode> {
+    pub fn recall_similar(&self, neurons: &[LtcNeuron], k: usize) -> Vec<&Episode> {
         if self.episodes.is_empty() || k == 0 {
             return Vec::new();
         }
@@ -265,13 +265,13 @@ fn sparse_cosine_similarity(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neuron::LiquidNeuron;
+    use crate::neuron::LtcNeuron;
 
-    fn make_neurons_with_values(values: &[f32]) -> Vec<LiquidNeuron> {
+    fn make_neurons_with_values(values: &[f32]) -> Vec<LtcNeuron> {
         values
             .iter()
             .map(|&v| {
-                let mut n = LiquidNeuron::new();
+                let mut n = LtcNeuron::new();
                 n.x = v;
                 n
             })

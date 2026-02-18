@@ -4,15 +4,15 @@
 //! The universal mesh core remains frozen.
 
 use crate::adaptation::adapter::AdapterLayer;
-use crate::neuron::LiquidNeuron;
+use crate::neuron::LtcNeuron;
 
 /// Compute the gradient for a single adapter layer forward pass.
 ///
 /// Returns (weight_in_grads, weight_out_grads, bias_grads) per adapter neuron.
 pub fn adapter_backward(
     adapter: &AdapterLayer,
-    universal_neurons: &[LiquidNeuron],
-    dl_d_adaptive: &[f32], // ∂L/∂(adaptive_neuron.x) for each output_to index
+    universal_neurons: &[LtcNeuron],
+    dl_d_adaptive: &[f32], // dL/d(adaptive_neuron.x) for each output_to index
 ) -> Vec<(Vec<f32>, Vec<f32>, f32)> {
     if !adapter.trainable {
         return adapter
@@ -49,8 +49,8 @@ pub fn adapter_backward(
         let tanh_val = pre_act.tanh();
         let tanh_deriv = 1.0 - tanh_val * tanh_val;
 
-        // Output: adaptive[out_idx] += Σ(an.x * an.weights_out[pos])
-        // ∂L/∂(an.x) = Σ_pos(∂L/∂adaptive[out_idx] * an.weights_out[pos])
+        // Output: adaptive[out_idx] += sum(an.x * an.weights_out[pos])
+        // dL/d(an.x) = sum_pos(dL/d_adaptive[out_idx] * an.weights_out[pos])
         let mut dl_d_an_x = 0.0f32;
         let mut d_weights_out = vec![0.0f32; an.weights_out.len()];
 
@@ -63,21 +63,21 @@ pub fn adapter_backward(
                     0.0
                 };
 
-                // ∂L/∂weights_out[pos] = ∂L/∂adaptive * an.x
+                // dL/dweights_out[pos] = dL/d_adaptive * an.x
                 d_weights_out[pos] = dl_out * an.x;
 
-                // ∂L/∂an.x
+                // dL/d(an.x)
                 dl_d_an_x += dl_out * an.weights_out[pos];
             }
         }
 
-        // ∂L/∂pre_act = ∂L/∂an.x * tanh'(pre_act)
+        // dL/dpre_act = dL/d(an.x) * tanh'(pre_act)
         let dl_d_pre = dl_d_an_x * tanh_deriv;
 
-        // ∂L/∂weights_in[k] = ∂L/∂pre_act * inputs[k]
+        // dL/dweights_in[k] = dL/dpre_act * inputs[k]
         let d_weights_in: Vec<f32> = inputs.iter().map(|&x| dl_d_pre * x).collect();
 
-        // ∂L/∂bias = ∂L/∂pre_act
+        // dL/dbias = dL/dpre_act
         let d_bias = dl_d_pre;
 
         neuron_grads.push((d_weights_in, d_weights_out, d_bias));
@@ -112,9 +112,9 @@ pub fn adapter_sgd_step(
 /// Uses the detection readout error as the loss signal.
 pub fn online_train_step(
     adapter: &mut AdapterLayer,
-    universal_neurons: &[LiquidNeuron],
-    _adaptive_neurons: &[LiquidNeuron],
-    error_signal: &[f32], // ∂L/∂(adaptive output) for each output_to position
+    universal_neurons: &[LtcNeuron],
+    _adaptive_neurons: &[LtcNeuron],
+    error_signal: &[f32], // dL/d(adaptive output) for each output_to position
     lr: f32,
 ) {
     let grads = adapter_backward(adapter, universal_neurons, error_signal);
@@ -125,10 +125,10 @@ pub fn online_train_step(
 mod tests {
     use super::*;
     use crate::adaptation::adapter::AdapterLayer;
-    use crate::neuron::LiquidNeuron;
+    use crate::neuron::LtcNeuron;
 
-    fn make_neurons(n: usize) -> Vec<LiquidNeuron> {
-        (0..n).map(|_| LiquidNeuron::new()).collect()
+    fn make_neurons(n: usize) -> Vec<LtcNeuron> {
+        (0..n).map(|_| LtcNeuron::new()).collect()
     }
 
     #[test]
