@@ -100,6 +100,9 @@ impl ReplayBuffer {
     }
 
     fn push(&mut self, seq_idx: usize, sample_idx: usize) {
+        if self.capacity == 0 {
+            return;
+        }
         if self.entries.len() < self.capacity {
             self.entries.push((seq_idx, sample_idx));
         } else {
@@ -802,6 +805,152 @@ mod tests {
             "Detection accuracy should be above chance: {:.1}%",
             metrics.final_detection_accuracy * 100.0
         );
+    }
+
+    #[test]
+    #[ignore] // A/B comparison ~60s. Run with: cargo test compare_training -- --ignored --nocapture
+    fn compare_training_improvements() {
+        // Same mesh topology, same seed, same dataset for both runs.
+        // Baseline: mini_batch_size=1, no weight decay, no LR schedule, no replay.
+        // Improved: mini_batch_size=4, weight decay, cosine LR, replay buffer.
+        // Both use the same number of optimizer steps so "improved" does 4x more
+        // forward passes — that's the tradeoff: cleaner gradients for more compute.
+
+        let shared = TrainingConfig {
+            stage1_steps: 30,
+            stage2_rounds: 2,
+            stage2_steps_per_round: 60,
+            stage2_memory_steps: 20,
+            stage2_prediction_steps: 20,
+            stage3_steps: 60,
+            mesh_steps_per_sample: 50,
+            synthetic_sequences: 12,
+            sequence_length: 50,
+            seed: 77,
+            ..TrainingConfig::default()
+        };
+
+        // --- Baseline run (old behavior) ---
+        let baseline_config = TrainingConfig {
+            mini_batch_size: 1,
+            weight_decay: 0.0,
+            lr_warmup_fraction: 0.0,
+            replay_buffer_size: 0,
+            replay_fraction: 0.0,
+            ..shared.clone()
+        };
+        let mut baseline_mesh = build_default_mesh();
+        let baseline_metrics = run_full_training(&mut baseline_mesh, &baseline_config);
+
+        // --- Improved run (new defaults) ---
+        let improved_config = TrainingConfig {
+            mini_batch_size: 4,
+            weight_decay: 1e-4,
+            lr_warmup_fraction: 0.05,
+            replay_buffer_size: 500,
+            replay_fraction: 0.1,
+            ..shared.clone()
+        };
+        let mut improved_mesh = build_default_mesh();
+        let improved_metrics = run_full_training(&mut improved_mesh, &improved_config);
+
+        // --- Analysis ---
+
+        // 1. Loss stability: compute std dev of consecutive loss differences.
+        fn loss_volatility(losses: &[f32]) -> f32 {
+            if losses.len() < 2 {
+                return 0.0;
+            }
+            let diffs: Vec<f32> = losses.windows(2).map(|w| (w[1] - w[0]).abs()).collect();
+            let mean = diffs.iter().sum::<f32>() / diffs.len() as f32;
+            let var = diffs.iter().map(|d| (d - mean).powi(2)).sum::<f32>() / diffs.len() as f32;
+            var.sqrt()
+        }
+
+        let baseline_s2_vol = loss_volatility(&baseline_metrics.stage2_detection_losses);
+        let improved_s2_vol = loss_volatility(&improved_metrics.stage2_detection_losses);
+        let baseline_s3_vol = loss_volatility(&baseline_metrics.stage3_losses);
+        let improved_s3_vol = loss_volatility(&improved_metrics.stage3_losses);
+
+        eprintln!("\n=== TRAINING COMPARISON ===");
+        eprintln!("                         Baseline    Improved");
+        eprintln!("Stage 2 det losses:      {}          {}",
+            baseline_metrics.stage2_detection_losses.len(),
+            improved_metrics.stage2_detection_losses.len());
+        eprintln!("Stage 2 volatility:      {:.4}      {:.4}", baseline_s2_vol, improved_s2_vol);
+        eprintln!("Stage 3 losses:          {}          {}",
+            baseline_metrics.stage3_losses.len(),
+            improved_metrics.stage3_losses.len());
+        eprintln!("Stage 3 volatility:      {:.4}      {:.4}", baseline_s3_vol, improved_s3_vol);
+        eprintln!("Detection accuracy:      {:.1}%       {:.1}%",
+            baseline_metrics.final_detection_accuracy * 100.0,
+            improved_metrics.final_detection_accuracy * 100.0);
+
+        if !baseline_metrics.stage3_losses.is_empty() && !improved_metrics.stage3_losses.is_empty() {
+            let bl_final = baseline_metrics.stage3_losses.last().unwrap();
+            let im_final = improved_metrics.stage3_losses.last().unwrap();
+            eprintln!("Stage 3 final loss:      {:.4}      {:.4}", bl_final, im_final);
+        }
+
+        // Print full loss trajectories for detailed analysis.
+        if !baseline_metrics.stage2_detection_losses.is_empty() {
+            eprintln!("\n--- Stage 2 Detection Loss Trajectory ---");
+            eprintln!("Baseline: {:?}",
+                baseline_metrics.stage2_detection_losses.iter()
+                    .map(|l| format!("{:.3}", l)).collect::<Vec<_>>());
+            eprintln!("Improved: {:?}",
+                improved_metrics.stage2_detection_losses.iter()
+                    .map(|l| format!("{:.3}", l)).collect::<Vec<_>>());
+        }
+        if !baseline_metrics.stage3_losses.is_empty() {
+            eprintln!("\n--- Stage 3 Loss Trajectory ---");
+            eprintln!("Baseline: {:?}",
+                baseline_metrics.stage3_losses.iter()
+                    .map(|l| format!("{:.3}", l)).collect::<Vec<_>>());
+            eprintln!("Improved: {:?}",
+                improved_metrics.stage3_losses.iter()
+                    .map(|l| format!("{:.3}", l)).collect::<Vec<_>>());
+        }
+
+        eprintln!("\n--- Stage 2 Causation Loss Trajectory ---");
+        eprintln!("Baseline: {:?}",
+            baseline_metrics.stage2_causation_losses.iter()
+                .map(|l| format!("{:.3}", l)).collect::<Vec<_>>());
+        eprintln!("Improved: {:?}",
+            improved_metrics.stage2_causation_losses.iter()
+                .map(|l| format!("{:.3}", l)).collect::<Vec<_>>());
+
+        // Assertions: both should produce valid results.
+        assert!(
+            baseline_metrics.stage3_losses.iter().all(|l| l.is_finite()),
+            "Baseline stage 3 losses should be finite"
+        );
+        assert!(
+            improved_metrics.stage3_losses.iter().all(|l| l.is_finite()),
+            "Improved stage 3 losses should be finite"
+        );
+        assert!(
+            baseline_metrics.final_detection_accuracy > 0.0,
+            "Baseline should have non-zero detection accuracy"
+        );
+        assert!(
+            improved_metrics.final_detection_accuracy > 0.0,
+            "Improved should have non-zero detection accuracy"
+        );
+
+        // The improved config should have lower loss volatility
+        // (smoother training) thanks to mini-batching.
+        // We allow some tolerance since this is stochastic.
+        eprintln!("\n=== VERDICT ===");
+        let vol_improved = improved_s2_vol <= baseline_s2_vol * 1.1;
+        let acc_improved = improved_metrics.final_detection_accuracy
+            >= baseline_metrics.final_detection_accuracy - 0.05;
+        eprintln!("Volatility improved: {} (baseline={:.4}, improved={:.4})",
+            vol_improved, baseline_s2_vol, improved_s2_vol);
+        eprintln!("Accuracy maintained:  {} (baseline={:.1}%, improved={:.1}%)",
+            acc_improved,
+            baseline_metrics.final_detection_accuracy * 100.0,
+            improved_metrics.final_detection_accuracy * 100.0);
     }
 
     #[test]
