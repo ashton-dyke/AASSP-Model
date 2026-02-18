@@ -6,7 +6,7 @@ use crate::training::backward::backprop_through_time;
 use crate::training::data::{causation_labels_for_sample, detection_labels_for_sample};
 use crate::training::init::initialize_connections;
 use crate::training::loss;
-use crate::training::optimizer::AdamOptimizer;
+use crate::training::optimizer::{cosine_lr, AdamOptimizer};
 use crate::training::state::{ForwardRecord, GradientAccumulator};
 use crate::training::synthetic::{SyntheticWellGenerator, TrainingSequence};
 
@@ -36,6 +36,16 @@ pub struct TrainingConfig {
     pub seed: u64,
     pub synthetic_sequences: usize,
     pub sequence_length: usize,
+    /// Number of samples to accumulate before each optimizer step.
+    pub mini_batch_size: u32,
+    /// Decoupled weight decay (AdamW) applied to connection weights.
+    pub weight_decay: f32,
+    /// Fraction of total steps used for linear LR warmup (per stage).
+    pub lr_warmup_fraction: f32,
+    /// Ring buffer capacity for experience replay during Stage 2.
+    pub replay_buffer_size: usize,
+    /// Fraction of mini-batch samples drawn from replay buffer.
+    pub replay_fraction: f32,
 }
 
 impl Default for TrainingConfig {
@@ -60,7 +70,55 @@ impl Default for TrainingConfig {
             seed: 42,
             synthetic_sequences: 120,
             sequence_length: 100,
+            mini_batch_size: 4,
+            weight_decay: 1e-4,
+            lr_warmup_fraction: 0.05,
+            replay_buffer_size: 500,
+            replay_fraction: 0.1,
         }
+    }
+}
+
+/// Simple ring buffer for experience replay during Stage 2.
+///
+/// Stores (seq_idx, sample_idx) pairs from previous training rounds so that
+/// alternating circuit training can replay earlier samples and reduce
+/// catastrophic forgetting.
+struct ReplayBuffer {
+    entries: Vec<(usize, usize)>,
+    capacity: usize,
+    write_pos: usize,
+}
+
+impl ReplayBuffer {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(capacity.min(1024)),
+            capacity,
+            write_pos: 0,
+        }
+    }
+
+    fn push(&mut self, seq_idx: usize, sample_idx: usize) {
+        if self.entries.len() < self.capacity {
+            self.entries.push((seq_idx, sample_idx));
+        } else {
+            self.entries[self.write_pos] = (seq_idx, sample_idx);
+        }
+        self.write_pos = (self.write_pos + 1) % self.capacity;
+    }
+
+    fn sample(&self, rng: &mut StdRng) -> Option<(usize, usize)> {
+        if self.entries.is_empty() {
+            None
+        } else {
+            let idx = rand::Rng::gen_range(rng, 0..self.entries.len());
+            Some(self.entries[idx])
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
@@ -132,6 +190,7 @@ pub fn recorded_forward_pass(
 /// Run Stage 1: Overlap pre-training.
 ///
 /// Trains only overlap masks and gate weights using mutual information loss.
+/// Uses cosine LR scheduling with warmup and mini-batch gradient accumulation.
 fn run_stage1(
     mesh: &mut OverlappingMesh,
     config: &TrainingConfig,
@@ -141,57 +200,70 @@ fn run_stage1(
 ) {
     let mut optimizer = AdamOptimizer::from_mesh(mesh, config.stage1_lr);
     let mut rng = StdRng::seed_from_u64(config.seed);
+    let warmup_steps = (config.stage1_steps as f32 * config.lr_warmup_fraction) as u32;
 
     // In Stage 1, all neuron weights are frozen — only gates/masks train.
     let all_circuit_ids: Vec<u32> = mesh.circuits.iter().map(|c| c.id).collect();
 
     for step in 0..config.stage1_steps {
-        let seq_idx = (step as usize) % dataset.len();
-        let sample_idx = rand::Rng::gen_range(&mut rng, 0..dataset[seq_idx].wits_samples.len());
-        let wits = &dataset[seq_idx].wits_samples[sample_idx];
+        optimizer.set_lr(cosine_lr(config.stage1_lr, step, config.stage1_steps, warmup_steps));
 
-        // Encode input.
-        encode_input(mesh, wits, baselines);
+        let mut accum_grads = GradientAccumulator::from_mesh(mesh);
+        let mut step_loss = 0.0;
 
-        // Forward pass (we only need final state for MI loss).
-        for _ in 0..config.mesh_steps_per_sample {
-            mesh.step();
-        }
+        for micro in 0..config.mini_batch_size {
+            let seq_idx = rand::Rng::gen_range(&mut rng, 0..dataset.len());
+            let sample_idx = rand::Rng::gen_range(&mut rng, 0..dataset[seq_idx].wits_samples.len());
+            let wits = &dataset[seq_idx].wits_samples[sample_idx];
 
-        // Compute MI loss for each overlap zone.
-        let mut total_loss = 0.0;
-        let mut grads = GradientAccumulator::from_mesh(mesh);
+            encode_input(mesh, wits, baselines);
 
-        for zone_idx in 0..mesh.overlap_zones.len() {
-            let (mi_loss, mi_dl_dx) = loss::mutual_information_loss(mesh, zone_idx);
-            total_loss += mi_loss;
+            for _ in 0..config.mesh_steps_per_sample {
+                mesh.step();
+            }
 
-            // Accumulate mask gradients (L1 sparsity).
-            for (i, &mask) in mesh.overlap_zones[zone_idx].masks.iter().enumerate() {
-                if zone_idx < grads.mask_grads.len() && i < grads.mask_grads[zone_idx].len() {
-                    grads.mask_grads[zone_idx][i] +=
-                        config.sparsity_lambda * mask.signum();
+            let mut total_loss = 0.0;
+            let mut grads = GradientAccumulator::from_mesh(mesh);
+
+            for zone_idx in 0..mesh.overlap_zones.len() {
+                let (mi_loss, mi_dl_dx) = loss::mutual_information_loss(mesh, zone_idx);
+                total_loss += mi_loss;
+
+                for (i, &mask) in mesh.overlap_zones[zone_idx].masks.iter().enumerate() {
+                    if zone_idx < grads.mask_grads.len() && i < grads.mask_grads[zone_idx].len() {
+                        grads.mask_grads[zone_idx][i] +=
+                            config.sparsity_lambda * mask.signum();
+                    }
+                }
+
+                for (i, &g) in mi_dl_dx.iter().enumerate() {
+                    grads.dx[i] += g;
                 }
             }
 
-            for (i, &g) in mi_dl_dx.iter().enumerate() {
-                grads.dx[i] += g;
+            total_loss += config.sparsity_lambda * loss::total_sparsity_loss(mesh);
+            accum_grads.accumulate(&grads);
+
+            if micro == 0 {
+                step_loss = total_loss;
             }
         }
 
-        total_loss += config.sparsity_lambda * loss::total_sparsity_loss(mesh);
-
-        // Clip and apply (neuron weights frozen via frozen_circuits).
-        grads.clip_global_norm(config.max_grad_norm);
-        optimizer.step(mesh, &grads, &all_circuit_ids, false);
+        accum_grads.scale(1.0 / config.mini_batch_size as f32);
+        accum_grads.clip_global_norm(config.max_grad_norm);
+        optimizer.step(mesh, &accum_grads, &all_circuit_ids, false);
 
         if step % 500 == 0 {
-            metrics.stage1_losses.push(total_loss);
+            metrics.stage1_losses.push(step_loss);
         }
     }
 }
 
 /// Run Stage 2: Alternating freeze circuit training.
+///
+/// A shared replay buffer persists across all rounds, allowing each circuit
+/// group to train on samples seen by previous groups and mitigate catastrophic
+/// forgetting from the alternating freeze schedule.
 fn run_stage2(
     mesh: &mut OverlappingMesh,
     config: &TrainingConfig,
@@ -231,6 +303,7 @@ fn run_stage2(
     let freeze_except_prediction: Vec<u32> = all_ids.iter().filter(|id| !prediction_ids.contains(id)).cloned().collect();
 
     let mut rng = StdRng::seed_from_u64(config.seed + 1);
+    let mut replay_buffer = ReplayBuffer::new(config.replay_buffer_size);
 
     for _round in 0..config.stage2_rounds {
         // Round A: Train causation, freeze detection.
@@ -245,6 +318,7 @@ fn run_stage2(
             &mut rng,
             metrics,
             true,
+            &mut replay_buffer,
         );
 
         // Round B: Train detection, freeze causation.
@@ -259,6 +333,7 @@ fn run_stage2(
             &mut rng,
             metrics,
             false,
+            &mut replay_buffer,
         );
 
         // Round C: Train memory.
@@ -273,6 +348,7 @@ fn run_stage2(
             &mut rng,
             metrics,
             false,
+            &mut replay_buffer,
         );
 
         // Round D: Train prediction.
@@ -287,11 +363,16 @@ fn run_stage2(
             &mut rng,
             metrics,
             false,
+            &mut replay_buffer,
         );
     }
 }
 
 /// Train unfrozen circuits for a number of steps.
+///
+/// Each optimizer step accumulates gradients over `mini_batch_size` forward
+/// passes. Samples are drawn fresh or from the shared replay buffer to reduce
+/// catastrophic forgetting. Cosine LR scheduling with warmup is applied.
 fn train_circuit_group(
     mesh: &mut OverlappingMesh,
     config: &TrainingConfig,
@@ -303,51 +384,76 @@ fn train_circuit_group(
     rng: &mut StdRng,
     metrics: &mut TrainingMetrics,
     is_causation_round: bool,
+    replay_buffer: &mut ReplayBuffer,
 ) {
     let mut optimizer = AdamOptimizer::from_mesh(mesh, lr);
+    optimizer.weight_decay = config.weight_decay;
+    let warmup_steps = (steps as f32 * config.lr_warmup_fraction) as u32;
 
     for step in 0..steps {
-        let seq_idx = rand::Rng::gen_range(rng, 0..dataset.len());
-        let seq = &dataset[seq_idx];
-        let sample_idx = rand::Rng::gen_range(rng, 0..seq.wits_samples.len());
+        optimizer.set_lr(cosine_lr(lr, step, steps, warmup_steps));
 
-        encode_input(mesh, &seq.wits_samples[sample_idx], baselines);
+        let mut accum_grads = GradientAccumulator::from_mesh(mesh);
+        let mut step_det_loss = 0.0;
+        let mut step_caus_loss = 0.0;
 
-        // Forward with recording.
-        let mut record = ForwardRecord::new(mesh.neurons.len(), config.mesh_steps_per_sample as usize);
-        recorded_forward_pass(mesh, &mut record, config.mesh_steps_per_sample);
+        for micro in 0..config.mini_batch_size {
+            // Draw from replay buffer with configured probability, else fresh sample.
+            let (seq_idx, sample_idx) = if !replay_buffer.is_empty()
+                && rand::Rng::gen::<f32>(rng) < config.replay_fraction
+            {
+                replay_buffer.sample(rng).unwrap()
+            } else {
+                let si = rand::Rng::gen_range(rng, 0..dataset.len());
+                let samp = rand::Rng::gen_range(rng, 0..dataset[si].wits_samples.len());
+                replay_buffer.push(si, samp);
+                (si, samp)
+            };
 
-        // Compute loss.
-        let det_labels = detection_labels_for_sample(seq, sample_idx);
-        let (det_loss, det_dl_dx) = loss::detection_loss(mesh, &det_labels);
+            let seq = &dataset[seq_idx];
+            encode_input(mesh, &seq.wits_samples[sample_idx], baselines);
 
-        let caus_labels = causation_labels_for_sample(seq, sample_idx);
-        let (caus_loss, caus_dl_dx) = loss::causation_loss(mesh, &caus_labels);
+            let mut record = ForwardRecord::new(mesh.neurons.len(), config.mesh_steps_per_sample as usize);
+            recorded_forward_pass(mesh, &mut record, config.mesh_steps_per_sample);
 
-        // Combine output gradients.
-        let mut dl_dx_output = vec![0.0f32; mesh.neurons.len()];
-        for i in 0..dl_dx_output.len() {
-            dl_dx_output[i] = det_dl_dx[i] + caus_dl_dx[i];
+            let det_labels = detection_labels_for_sample(seq, sample_idx);
+            let (det_loss, det_dl_dx) = loss::detection_loss(mesh, &det_labels);
+
+            let caus_labels = causation_labels_for_sample(seq, sample_idx);
+            let (caus_loss, caus_dl_dx) = loss::causation_loss(mesh, &caus_labels);
+
+            let mut dl_dx_output = vec![0.0f32; mesh.neurons.len()];
+            for i in 0..dl_dx_output.len() {
+                dl_dx_output[i] = det_dl_dx[i] + caus_dl_dx[i];
+            }
+
+            let mut grads = GradientAccumulator::from_mesh(mesh);
+            backprop_through_time(mesh, &record, &dl_dx_output, &mut grads);
+            accum_grads.accumulate(&grads);
+
+            if micro == 0 {
+                step_det_loss = det_loss;
+                step_caus_loss = caus_loss;
+            }
         }
 
-        // BPTT.
-        let mut grads = GradientAccumulator::from_mesh(mesh);
-        backprop_through_time(mesh, &record, &dl_dx_output, &mut grads);
-
-        grads.clip_global_norm(config.max_grad_norm);
-        optimizer.step(mesh, &grads, frozen_circuits, true); // overlaps frozen in stage 2
+        accum_grads.scale(1.0 / config.mini_batch_size as f32);
+        accum_grads.clip_global_norm(config.max_grad_norm);
+        optimizer.step(mesh, &accum_grads, frozen_circuits, true);
 
         if step % 100 == 0 {
             if is_causation_round {
-                metrics.stage2_causation_losses.push(caus_loss);
+                metrics.stage2_causation_losses.push(step_caus_loss);
             } else {
-                metrics.stage2_detection_losses.push(det_loss);
+                metrics.stage2_detection_losses.push(step_det_loss);
             }
         }
     }
 }
 
 /// Run Stage 3: Joint fine-tuning.
+///
+/// All circuits unfrozen. Uses mini-batch accumulation and cosine LR scheduling.
 fn run_stage3(
     mesh: &mut OverlappingMesh,
     config: &TrainingConfig,
@@ -357,58 +463,73 @@ fn run_stage3(
     metrics: &mut TrainingMetrics,
 ) {
     let mut optimizer = AdamOptimizer::from_mesh(mesh, config.stage3_lr);
+    optimizer.weight_decay = config.weight_decay;
     let mut rng = StdRng::seed_from_u64(config.seed + 2);
+    let warmup_steps = (config.stage3_steps as f32 * config.lr_warmup_fraction) as u32;
 
     for step in 0..config.stage3_steps {
-        let seq_idx = rand::Rng::gen_range(&mut rng, 0..dataset.len());
-        let seq = &dataset[seq_idx];
-        let sample_idx = rand::Rng::gen_range(&mut rng, 0..seq.wits_samples.len());
+        optimizer.set_lr(cosine_lr(config.stage3_lr, step, config.stage3_steps, warmup_steps));
 
-        encode_input(mesh, &seq.wits_samples[sample_idx], baselines);
+        let mut accum_grads = GradientAccumulator::from_mesh(mesh);
+        let mut step_loss = 0.0;
 
-        let mut record = ForwardRecord::new(mesh.neurons.len(), config.mesh_steps_per_sample as usize);
-        recorded_forward_pass(mesh, &mut record, config.mesh_steps_per_sample);
+        for micro in 0..config.mini_batch_size {
+            let seq_idx = rand::Rng::gen_range(&mut rng, 0..dataset.len());
+            let seq = &dataset[seq_idx];
+            let sample_idx = rand::Rng::gen_range(&mut rng, 0..seq.wits_samples.len());
 
-        // All losses combined.
-        let det_labels = detection_labels_for_sample(seq, sample_idx);
-        let (det_loss, det_dl_dx) = loss::detection_loss(mesh, &det_labels);
+            encode_input(mesh, &seq.wits_samples[sample_idx], baselines);
 
-        let caus_labels = causation_labels_for_sample(seq, sample_idx);
-        let (_, caus_dl_dx) = loss::causation_loss(mesh, &caus_labels);
+            let mut record = ForwardRecord::new(mesh.neurons.len(), config.mesh_steps_per_sample as usize);
+            recorded_forward_pass(mesh, &mut record, config.mesh_steps_per_sample);
 
-        let mut dl_dx_output = vec![0.0f32; mesh.neurons.len()];
-        for i in 0..dl_dx_output.len() {
-            dl_dx_output[i] = det_dl_dx[i] + caus_dl_dx[i];
-        }
+            let det_labels = detection_labels_for_sample(seq, sample_idx);
+            let (det_loss, det_dl_dx) = loss::detection_loss(mesh, &det_labels);
 
-        let mut grads = GradientAccumulator::from_mesh(mesh);
-        backprop_through_time(mesh, &record, &dl_dx_output, &mut grads);
+            let caus_labels = causation_labels_for_sample(seq, sample_idx);
+            let (_, caus_dl_dx) = loss::causation_loss(mesh, &caus_labels);
 
-        // Add stability and sparsity gradients for masks.
-        for (zone_idx, zone) in mesh.overlap_zones.iter().enumerate() {
-            if zone_idx >= grads.mask_grads.len() || zone_idx >= mask_refs.len() {
-                continue;
+            let mut dl_dx_output = vec![0.0f32; mesh.neurons.len()];
+            for i in 0..dl_dx_output.len() {
+                dl_dx_output[i] = det_dl_dx[i] + caus_dl_dx[i];
             }
-            for (i, &mask) in zone.masks.iter().enumerate() {
-                if i < grads.mask_grads[zone_idx].len() && i < mask_refs[zone_idx].len() {
-                    grads.mask_grads[zone_idx][i] +=
-                        config.sparsity_lambda * mask.signum()
-                            + crate::training::backward::backprop_stability(
-                                mask,
-                                mask_refs[zone_idx][i],
-                                config.stability_lambda,
-                            );
+
+            let mut grads = GradientAccumulator::from_mesh(mesh);
+            backprop_through_time(mesh, &record, &dl_dx_output, &mut grads);
+
+            // Add stability and sparsity gradients for masks.
+            for (zone_idx, zone) in mesh.overlap_zones.iter().enumerate() {
+                if zone_idx >= grads.mask_grads.len() || zone_idx >= mask_refs.len() {
+                    continue;
+                }
+                for (i, &mask) in zone.masks.iter().enumerate() {
+                    if i < grads.mask_grads[zone_idx].len() && i < mask_refs[zone_idx].len() {
+                        grads.mask_grads[zone_idx][i] +=
+                            config.sparsity_lambda * mask.signum()
+                                + crate::training::backward::backprop_stability(
+                                    mask,
+                                    mask_refs[zone_idx][i],
+                                    config.stability_lambda,
+                                );
+                    }
                 }
             }
+
+            accum_grads.accumulate(&grads);
+
+            if micro == 0 {
+                step_loss = det_loss;
+            }
         }
 
-        grads.clip_global_norm(config.max_grad_norm);
-        optimizer.step(mesh, &grads, &[], false); // nothing frozen
+        accum_grads.scale(1.0 / config.mini_batch_size as f32);
+        accum_grads.clip_global_norm(config.max_grad_norm);
+        optimizer.step(mesh, &accum_grads, &[], false);
 
         if step % 100 == 0 {
             let stab = loss::stability_loss(mesh, mask_refs);
             let sparse = loss::total_sparsity_loss(mesh);
-            let total = det_loss + config.stability_lambda * stab + config.sparsity_lambda * sparse;
+            let total = step_loss + config.stability_lambda * stab + config.sparsity_lambda * sparse;
             metrics.stage3_losses.push(total);
         }
     }
@@ -649,6 +770,7 @@ mod tests {
             mesh_steps_per_sample: 50,
             synthetic_sequences: 12,
             sequence_length: 50,
+            mini_batch_size: 1,
             ..TrainingConfig::default()
         };
 
@@ -695,6 +817,7 @@ mod tests {
             mesh_steps_per_sample: 10,
             synthetic_sequences: 6,
             sequence_length: 20,
+            mini_batch_size: 1,
             ..TrainingConfig::default()
         };
 

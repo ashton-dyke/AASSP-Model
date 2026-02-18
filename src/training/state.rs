@@ -238,6 +238,82 @@ impl GradientAccumulator {
         sum.sqrt() as f32
     }
 
+    /// Add gradients from another accumulator element-wise.
+    pub fn accumulate(&mut self, other: &GradientAccumulator) {
+        for (a, b) in self.bias_grads.iter_mut().zip(&other.bias_grads) {
+            *a += b;
+        }
+        for (aw, bw) in self.weight_grads.iter_mut().zip(&other.weight_grads) {
+            for (a, b) in aw.iter_mut().zip(bw) {
+                *a += b;
+            }
+        }
+        for (a, b) in self.dx.iter_mut().zip(&other.dx) {
+            *a += b;
+        }
+        for (ag, bg) in self.gate_grads.iter_mut().zip(&other.gate_grads) {
+            for (ar, br) in ag.d_weights_ih.iter_mut().zip(&bg.d_weights_ih) {
+                for (a, b) in ar.iter_mut().zip(br) {
+                    *a += b;
+                }
+            }
+            for (a, b) in ag.d_bias_h.iter_mut().zip(&bg.d_bias_h) {
+                *a += b;
+            }
+            for (ar, br) in ag.d_weights_ho.iter_mut().zip(&bg.d_weights_ho) {
+                for (a, b) in ar.iter_mut().zip(br) {
+                    *a += b;
+                }
+            }
+            for (a, b) in ag.d_bias_o.iter_mut().zip(&bg.d_bias_o) {
+                *a += b;
+            }
+        }
+        for (am, bm) in self.mask_grads.iter_mut().zip(&other.mask_grads) {
+            for (a, b) in am.iter_mut().zip(bm) {
+                *a += b;
+            }
+        }
+    }
+
+    /// Scale all gradients by a factor (e.g. 1/mini_batch_size).
+    pub fn scale(&mut self, factor: f32) {
+        for g in &mut self.bias_grads {
+            *g *= factor;
+        }
+        for wg in &mut self.weight_grads {
+            for g in wg {
+                *g *= factor;
+            }
+        }
+        for g in &mut self.dx {
+            *g *= factor;
+        }
+        for gg in &mut self.gate_grads {
+            for row in &mut gg.d_weights_ih {
+                for g in row {
+                    *g *= factor;
+                }
+            }
+            for g in &mut gg.d_bias_h {
+                *g *= factor;
+            }
+            for row in &mut gg.d_weights_ho {
+                for g in row {
+                    *g *= factor;
+                }
+            }
+            for g in &mut gg.d_bias_o {
+                *g *= factor;
+            }
+        }
+        for mg in &mut self.mask_grads {
+            for g in mg {
+                *g *= factor;
+            }
+        }
+    }
+
     /// Clip all gradients so the global norm <= max_norm.
     pub fn clip_global_norm(&mut self, max_norm: f32) {
         let norm = self.global_norm();
@@ -313,5 +389,42 @@ mod tests {
         acc.clip_global_norm(1.0);
         let norm = acc.global_norm();
         assert!((norm - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn accumulate_adds_element_wise() {
+        let mut a = GradientAccumulator::new(3, &[2, 1, 0], 1, &[2], &[]);
+        let mut b = GradientAccumulator::new(3, &[2, 1, 0], 1, &[2], &[]);
+
+        a.bias_grads[0] = 1.0;
+        a.bias_grads[1] = 2.0;
+        a.weight_grads[0][0] = 0.5;
+        a.mask_grads[0][0] = 0.3;
+
+        b.bias_grads[0] = 3.0;
+        b.bias_grads[1] = 4.0;
+        b.weight_grads[0][0] = 1.5;
+        b.mask_grads[0][0] = 0.7;
+
+        a.accumulate(&b);
+
+        assert!((a.bias_grads[0] - 4.0).abs() < 1e-9);
+        assert!((a.bias_grads[1] - 6.0).abs() < 1e-9);
+        assert!((a.weight_grads[0][0] - 2.0).abs() < 1e-9);
+        assert!((a.mask_grads[0][0] - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn scale_divides_all_grads() {
+        let mut acc = GradientAccumulator::new(2, &[1, 1], 0, &[], &[]);
+        acc.bias_grads[0] = 4.0;
+        acc.bias_grads[1] = 8.0;
+        acc.weight_grads[0][0] = 2.0;
+
+        acc.scale(0.25);
+
+        assert!((acc.bias_grads[0] - 1.0).abs() < 1e-9);
+        assert!((acc.bias_grads[1] - 2.0).abs() < 1e-9);
+        assert!((acc.weight_grads[0][0] - 0.5).abs() < 1e-9);
     }
 }

@@ -43,13 +43,32 @@ fn adam_delta(
     lr * m_hat / (v_hat.sqrt() + epsilon)
 }
 
-/// Adam optimizer.
+/// Compute learning rate with linear warmup and cosine decay.
+///
+/// During the first `warmup_steps`, LR ramps linearly from 0 to `base_lr`.
+/// After warmup, LR decays via cosine schedule to 10% of `base_lr`.
+pub fn cosine_lr(base_lr: f32, step: u32, total_steps: u32, warmup_steps: u32) -> f32 {
+    if total_steps == 0 {
+        return base_lr;
+    }
+    if step < warmup_steps {
+        base_lr * (step + 1) as f32 / warmup_steps.max(1) as f32
+    } else {
+        let min_lr = base_lr * 0.1;
+        let decay_steps = total_steps.saturating_sub(warmup_steps).max(1);
+        let progress = (step - warmup_steps) as f32 / decay_steps as f32;
+        min_lr + 0.5 * (base_lr - min_lr) * (1.0 + (std::f32::consts::PI * progress).cos())
+    }
+}
+
+/// AdamW optimizer (Adam with decoupled weight decay).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdamOptimizer {
     pub lr: f32,
     pub beta1: f32,
     pub beta2: f32,
     pub epsilon: f32,
+    pub weight_decay: f32,
     pub t: u64,
 
     /// State for neuron biases.
@@ -69,12 +88,18 @@ impl AdamOptimizer {
             beta1: 0.9,
             beta2: 0.999,
             epsilon: 1e-8,
+            weight_decay: 0.0,
             t: 0,
             bias_state: AdamState::new(neuron_count),
             weight_state: AdamState::new(total_weights),
             gate_state: AdamState::new(gate_params),
             mask_state: AdamState::new(mask_params),
         }
+    }
+
+    /// Update the learning rate (for LR scheduling).
+    pub fn set_lr(&mut self, lr: f32) {
+        self.lr = lr;
     }
 
     /// Build an optimizer sized for a mesh.
@@ -143,6 +168,10 @@ impl AdamOptimizer {
                     && flat_idx < self.weight_state.m.len()
                 {
                     let g = grads.weight_grads[neuron_idx][conn_idx];
+                    // AdamW: decoupled weight decay applied before adam step.
+                    if self.weight_decay > 0.0 {
+                        *weight *= 1.0 - lr * self.weight_decay;
+                    }
                     *weight -= adam_delta(
                         lr, beta1, beta2, epsilon,
                         &mut self.weight_state.m[flat_idx],
@@ -269,5 +298,44 @@ mod tests {
         let opt = AdamOptimizer::from_mesh(&mesh, 1e-3);
 
         assert_eq!(opt.bias_state.m.len(), 10);
+    }
+
+    #[test]
+    fn cosine_lr_warmup_ramps_linearly() {
+        let lr = cosine_lr(0.001, 0, 100, 10);
+        assert!(lr > 0.0 && lr < 0.001, "Step 0 should be below base LR during warmup");
+
+        let lr_mid = cosine_lr(0.001, 5, 100, 10);
+        assert!(lr_mid > lr, "LR should increase during warmup");
+
+        let lr_end_warmup = cosine_lr(0.001, 9, 100, 10);
+        assert!((lr_end_warmup - 0.001).abs() < 1e-5, "LR should reach base at end of warmup");
+    }
+
+    #[test]
+    fn cosine_lr_decays_after_warmup() {
+        let lr_start = cosine_lr(0.001, 10, 100, 10);
+        let lr_mid = cosine_lr(0.001, 55, 100, 10);
+        let lr_end = cosine_lr(0.001, 99, 100, 10);
+
+        assert!(lr_start > lr_mid, "LR should decrease after warmup");
+        assert!(lr_mid > lr_end, "LR should continue decreasing");
+        // Should decay to ~10% of base at the end.
+        assert!(lr_end >= 0.001 * 0.09, "LR should not go below min");
+        assert!(lr_end <= 0.001 * 0.2, "LR should be near min at end");
+    }
+
+    #[test]
+    fn cosine_lr_handles_zero_steps() {
+        let lr = cosine_lr(0.001, 0, 0, 0);
+        assert!((lr - 0.001).abs() < 1e-9, "Zero total_steps should return base LR");
+    }
+
+    #[test]
+    fn set_lr_updates_rate() {
+        let mut opt = AdamOptimizer::new(0.001, 2, 2, 0, 0);
+        assert!((opt.lr - 0.001).abs() < 1e-9);
+        opt.set_lr(0.0005);
+        assert!((opt.lr - 0.0005).abs() < 1e-9);
     }
 }
