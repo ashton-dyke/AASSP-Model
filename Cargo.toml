@@ -1,0 +1,15 @@
+[package]
+name = "sairen-mesh"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rayon = "1.8"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+thiserror = "1"
+
+[dev-dependencies]
+approx = "0.5"
