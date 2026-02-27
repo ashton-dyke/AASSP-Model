@@ -16,11 +16,11 @@ pub fn build_default_mesh() -> OverlappingMesh {
     // ── Detection block: 0..1023 (5 circuits) ──
     // Each detection circuit gets ~204 neurons.
     let det_circuits = vec![
-        ("kick_detection",    0..204,   0.01),
-        ("loss_detection",    204..408, 0.01),
-        ("packoff_detection", 408..612, 0.015),
-        ("stickslip_detect",  612..816, 0.02),
-        ("founder_detect",    816..1024,0.02),
+        ("kick_detection",    0..204,   0.1),
+        ("loss_detection",    204..408, 0.1),
+        ("packoff_detection", 408..612, 0.12),
+        ("stickslip_detect",  612..816, 0.15),
+        ("founder_detect",    816..1024,0.15),
     ];
 
     for (i, (name, range, tau)) in det_circuits.iter().enumerate() {
@@ -37,9 +37,9 @@ pub fn build_default_mesh() -> OverlappingMesh {
 
     // ── Causation block: 1024..2047 (3 circuits) ──
     let caus_circuits = vec![
-        ("torque_causation",   1024..1366, 0.05),
-        ("pressure_causation", 1366..1706, 0.05),
-        ("flow_causation",     1706..2048, 0.05),
+        ("torque_causation",   1024..1366, 0.15),
+        ("pressure_causation", 1366..1706, 0.15),
+        ("flow_causation",     1706..2048, 0.15),
     ];
 
     for (i, (name, range, tau)) in caus_circuits.iter().enumerate() {
@@ -75,8 +75,8 @@ pub fn build_default_mesh() -> OverlappingMesh {
 
     // ── Prediction block: 3584..4607 (2 circuits) ──
     let pred_circuits = vec![
-        ("state_prediction", 3584..4096, 0.02),
-        ("rop_prediction",   4096..4608, 0.03),
+        ("state_prediction", 3584..4096, 0.1),
+        ("rop_prediction",   4096..4608, 0.12),
     ];
 
     for (i, (name, range, tau)) in pred_circuits.iter().enumerate() {

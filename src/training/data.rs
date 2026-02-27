@@ -83,6 +83,50 @@ pub fn causation_labels_for_sample(
     labels
 }
 
+/// Generate prediction supervision labels for a specific sample.
+///
+/// Looks 5 samples ahead in the sequence and uses the future WITS values
+/// (normalised to [-1, 1]) as targets. Returns labels for:
+/// - Circuit 11 (state_prediction): all 14 features
+/// - Circuit 12 (rop_prediction): feature index 1 (ROP)
+pub fn prediction_labels_for_sample(
+    sequence: &TrainingSequence,
+    sample_idx: usize,
+    baselines: &crate::io::encoding::Baselines,
+) -> Vec<(usize, Vec<(usize, f32)>)> {
+    let horizon = 5;
+    let future_idx = sample_idx + horizon;
+
+    if future_idx >= sequence.wits_samples.len() {
+        return Vec::new();
+    }
+
+    let future_wits = &sequence.wits_samples[future_idx];
+    let features = future_wits.as_feature_array();
+    let baseline_arr = baselines.as_array();
+
+    let normalised: Vec<f32> = features
+        .iter()
+        .zip(baseline_arr.iter())
+        .map(|(&val, bl)| crate::io::encoding::normalise(val, bl))
+        .collect();
+
+    let mut labels = Vec::new();
+
+    // Circuit 11 (state_prediction): all 14 features.
+    let state_targets: Vec<(usize, f32)> = normalised
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (i, v))
+        .collect();
+    labels.push((11, state_targets));
+
+    // Circuit 12 (rop_prediction): feature index 1 (ROP).
+    labels.push((12, vec![(1, normalised[1])]));
+
+    labels
+}
+
 /// Shuffle indices using Fisher-Yates.
 pub fn shuffle_indices(n: usize, rng: &mut impl rand::Rng) -> Vec<usize> {
     let mut indices: Vec<usize> = (0..n).collect();

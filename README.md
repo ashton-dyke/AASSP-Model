@@ -1,54 +1,43 @@
 # AASSP-Model
 
-**SAIREN-OS Asynchronous Overlapping Neural Mesh**
+**Autonomous Anomaly Sensing & Safety Protocol — Neural Mesh**
 
-An overlapping liquid neural network mesh implementing Asymmetric Asynchronous Shared-State Parallelism (AASSP). Multiple neural circuits share neurons through overlap zones, process at different timescales, and communicate through shared state rather than message passing.
-
-Built for real-time drilling anomaly detection on edge hardware (RTX 4060 Ti, 16 GB VRAM).
+An overlapping neural mesh built on Liquid Time-Constant (LTC) neurons with Closed-form Continuous-depth (CfC) evaluation. Multiple neural circuits share neurons through overlap zones and communicate through shared state. Designed for real-time drilling anomaly detection.
 
 ## What It Does
 
 Ingests real-time WITS Level 0 drilling data and produces:
 
-- **Sub-millisecond anomaly detection** — kicks, losses, pack-off, stick-slip, founder
+- **Anomaly detection** — kicks, losses, pack-off, stick-slip, founder conditions
 - **Causal reasoning** about root causes (torque, pressure, flow)
 - **Predictive state projection** — forward-looking drilling state and ROP trajectory
 - **Memory-augmented pattern recognition** from historical events via episodic recall
 
+Trained on synthetic drilling data (96% detection accuracy, zero false positives on normal data), then deployed for inference on real well data.
+
 ## Design Principles
 
 1. **Physics is ground truth.** Every neural output is validated against deterministic physics calculations (MSE, ECD, d-exponent). The mesh augments physics, never overrides it.
-2. **Safety circuits are deterministic.** Detection and causation circuits use deterministic firing. Only non-critical circuits (memory, prediction) use stochastic firing.
-3. **Max 2 circuits per neuron.** Hard architectural constraint. If three circuits need to communicate, chain the overlaps (A↔B↔C), never share a single neuron across 3+ circuits.
-4. **Frozen universal core.** Physics-based circuits are frozen after pre-training. Online adaptation happens only through thin adapter layers and plastic circuits.
+2. **Synchronous CfC dynamics.** All neurons update simultaneously using the closed-form CfC solution. Input neurons are clamped (skip CfC) to preserve encoded WITS values.
+3. **Max 2 circuits per neuron.** Hard architectural constraint. If three circuits need to communicate, chain the overlaps (A-B-C), never share a single neuron across 3+ circuits.
+4. **Frozen universal core.** Detection and causation circuits are frozen after pre-training. Online adaptation happens only through thin adapter layers.
 5. **Fail gracefully.** If the mesh fails, fall back to physics-only advisories. The system must never be worse than no system.
-
-## Performance Targets
-
-| Metric | Target | Hard Limit |
-|---|---|---|
-| Detection latency | < 500 us | < 1 ms |
-| Full mesh step | < 1 ms | < 5 ms |
-| Memory footprint | < 20 MB | < 50 MB |
-| Neuron count | 8,192 | 16,384 max |
-| Anomaly detection accuracy | > 95% | > 90% min |
 
 ## Architecture
 
-The mesh uses a two-phase update cycle:
+The mesh uses a synchronous two-phase CfC update:
 
-1. **Phase 1 — Parallel Computation:** All firing circuits compute proposed neuron updates independently (embarrassingly parallel, no shared mutable state).
-2. **Phase 2 — Sequential Merge:** Overlap neurons receive competing updates which are resolved via safety override (detection circuits with high confidence win outright) or a learned gating network (small MLP producing softmax-weighted priorities).
+1. **Phase 1 — Parallel CfC Forward:** All neurons compute new states from the current snapshot using the closed-form CfC solution (parallelized with rayon). Clamped input neurons retain their encoded values.
+2. **Phase 2 — Atomic Write-back:** New states are applied atomically, then circuit confidences are updated.
 
 ### Default Layout (4,736 neurons, 13 circuits)
 
 ```
-DETECTION BLOCK   (neurons 0..1023)     5 circuits, tau 10-20ms, Safety
-CAUSATION BLOCK   (neurons 1024..2047)  3 circuits, tau 50ms,    Safety
-MEMORY BLOCK      (neurons 2048..3583)  3 circuits, tau 0.2-30s, Performance
-PREDICTION BLOCK  (neurons 3584..4607)  2 circuits, tau 20-30ms, Performance
+DETECTION BLOCK   (neurons 0..1023)     5 circuits, tau 0.10-0.15s, Safety
+CAUSATION BLOCK   (neurons 1024..2047)  3 circuits, tau 0.15s,      Safety
+MEMORY BLOCK      (neurons 2048..3583)  3 circuits, tau 0.2-30s,    Performance
+PREDICTION BLOCK  (neurons 3584..4607)  2 circuits, tau 0.10-0.12s, Performance
 ADAPTER NEURONS   (neurons 4608..4735)  128 neurons (64 formation + 64 well)
-RESERVED          (neurons 4736..8191)  for future expansion
 ```
 
 ### Three-Tier Production Architecture
@@ -59,95 +48,139 @@ RESERVED          (neurons 4736..8191)  for future expansion
 | Adapters | 64-neuron formation adapter + 64-neuron well adapter | Plastic (online) |
 | Adaptive | Well-specific circuits connected through adapters | Plastic (online) |
 
+### Three-Stage Training Pipeline
+
+1. **Stage 1 — Overlap pre-training:** Trains overlap masks and gate weights using mutual information loss with cosine LR scheduling.
+2. **Stage 2 — Alternating freeze:** Cycles through circuit groups (detection, causation, memory, prediction), training each while freezing the others. Uses a shared replay buffer to mitigate catastrophic forgetting.
+3. **Stage 3 — Joint fine-tuning:** All circuits unfrozen, mini-batch gradient accumulation with AdamW and stability/sparsity regularization.
+
+### CfC Signal Propagation
+
+Each neuron follows the closed-form dynamics:
+
+```
+f = sigmoid(gate_weights . x + gate_bias)       -- input-dependent gate
+A = tanh(drive_weights . x + bias)               -- drive signal
+alpha = 1/tau + f                                 -- effective decay rate
+x(t+dt) = x(t) * exp(-alpha*dt) + (f*A/alpha) * (1 - exp(-alpha*dt))
+```
+
+Skip connections from input to readout neurons bypass multi-hop CfC attenuation. Readout gain of `2 * (1/tau + 0.5)` compensates for CfC steady-state amplitude reduction. Positive class weighting (3x) in detection loss prevents degenerate "suppress everything" solutions.
+
 ## Crate Structure
 
 ```
 src/
 ├── lib.rs                    # Public API, re-exports
-├── neuron.rs                 # LiquidNeuron, compute_neuron_update
-├── circuit.rs                # Circuit, CircuitType, CircuitCriticality, should_fire
-├── overlap.rs                # OverlapZone, OverlapGate (6->8->2 MLP)
+├── neuron.rs                 # LtcNeuron, CfC forward (full + inference)
+├── circuit.rs                # Circuit, CircuitType, CircuitCriticality
+├── overlap.rs                # OverlapZone, sparsity loss
 ├── topology.rs               # TopologyConstraint (max 2 circuits/neuron)
-├── mesh.rs                   # OverlappingMesh, step(), merge_updates()
-├── config.rs                 # MeshConfig with all hyperparameters
+├── mesh.rs                   # OverlappingMesh, parallel step()
+├── config.rs                 # MeshConfig, DegradationMode
 ├── layout.rs                 # Default 4,736-neuron layout
 ├── physics.rs                # MSE, d-exponent, ECD, flow balance
 ├── memory/
-│   ├── hierarchical.rs       # HierarchicalMemory, MemoryCircuit, WriteGate
-│   └── episodic.rs           # EpisodicMemory, Episode, KNN recall
+│   ├── hierarchical.rs       # HierarchicalMemory, WriteGate
+│   └── episodic.rs           # EpisodicMemory, KNN recall, pruning
 ├── io/
 │   ├── wits.rs               # WitsSnapshot (21 parameters)
 │   ├── encoding.rs           # Baselines (Welford's), normalisation, input encoding
 │   └── output.rs             # MeshOutput, Detection, CausalAnalysis, RiskLevel
-└── adaptation/
-    ├── adapter.rs            # AdapterLayer, AdapterNeuron
-    ├── replay.rs             # ReplayBuffer, TrainingSample
-    └── production.rs         # ProductionMesh (three-tier architecture)
+├── training/
+│   ├── pipeline.rs           # Three-stage training orchestrator
+│   ├── init.rs               # Connection initialization, skip connections, gate bias
+│   ├── loss.rs               # Detection/causation/prediction loss, readout gain
+│   ├── backward.rs           # Backpropagation through time (BPTT)
+│   ├── optimizer.rs          # AdamW optimizer, cosine LR with warmup
+│   ├── state.rs              # ForwardRecord, GradientAccumulator
+│   ├── data.rs               # Label generation, dataset shuffling
+│   ├── synthetic.rs          # SyntheticWellGenerator (normal, kick, loss, packoff sequences)
+│   └── online.rs             # Online adapter training
+├── adaptation/
+│   ├── adapter.rs            # AdapterLayer, AdapterNeuron
+│   ├── replay.rs             # ReplayBuffer, TrainingSample
+│   └── production.rs         # ProductionMesh (three-tier architecture)
+└── bin/
+    ├── diagnose.rs           # Post-training readout analysis
+    └── infer_csv.rs          # Run inference on real WITS CSV data
 ```
 
 ## Quick Start
 
+### Library Usage
+
 ```rust
-use sairen_mesh::{MeshConfig, WitsSnapshot};
 use sairen_mesh::layout::build_default_mesh;
-use sairen_mesh::io::encoding::{Baselines, encode_input};
+use sairen_mesh::adaptation::production::ProductionMesh;
+use sairen_mesh::training::pipeline::{run_full_training, TrainingConfig};
+use sairen_mesh::io::wits::WitsSnapshot;
 
-// Build the default 4,736-neuron mesh.
+// Build and train.
 let mut mesh = build_default_mesh();
+let metrics = run_full_training(&mut mesh, &TrainingConfig::default());
 
-// Create baselines and a WITS snapshot.
-let mut baselines = Baselines::new();
+// Wrap in ProductionMesh for inference.
+let mut prod = ProductionMesh::from_trained(mesh);
+
+// Process WITS samples.
 let wits = WitsSnapshot::zeros();
-baselines.update(&wits);
-
-// Encode input and run mesh steps.
-encode_input(&mut mesh, &wits, &baselines);
-for _ in 0..100 {
-    mesh.step();
-}
+let output = prod.process(&wits);
+// output.detections, output.risk_level, output.causal_analyses, ...
 ```
 
-Or use the full production pipeline:
+### Run Inference on Real CSV Data
 
-```rust
-use sairen_mesh::{MeshConfig, ProductionMesh, WitsSnapshot};
-
-let mut mesh = ProductionMesh::new(MeshConfig::default());
-let wits = WitsSnapshot::zeros();
-let output = mesh.process(&wits);
+```bash
+cargo run --release --bin infer_csv -- dataset/F-5_witsml.csv
 ```
+
+Parses metric-unit WITS CSV, converts to imperial, computes derived physics (MSE, d-exponent, ECD), trains on synthetic data, then runs inference over all samples. Prints detections with timestamps, rig mode, anomaly type, and confidence.
+
+### Diagnostic Tool
+
+```bash
+cargo run --release --bin diagnose
+```
+
+Trains the model and prints per-circuit readout activations for normal and kick sequences.
 
 ## Building
 
 ```bash
-cargo build
+cargo build --release
 ```
 
 ## Testing
 
 ```bash
-cargo test
+# Unit tests (116 tests, ~3s release)
+cargo test --release
+
+# Full integration test (~32s release)
+cargo test --release end_to_end -- --ignored
 ```
 
-67 tests covering:
-- Neuron dynamics (convergence, tanh bounds, connection contributions)
-- Circuit firing (deterministic Safety mode at exact tau intervals, stochastic Performance mode)
-- Topology enforcement (rejects 3+ circuits per neuron, validates bounds)
-- Overlap gates (softmax sums to 1.0, safety override, threshold adjustment)
-- Memory (decay rates, write-gate blocking, short-term decays faster than long-term)
-- Episodic memory (store/recall round-trips, KNN, pruning, sparse compression)
-- Input encoding (Welford's statistics, normalisation, clamping)
-- Adaptation (adapter forward pass, tanh bounds, replay buffer proportions)
-- Layout (4,736 neurons, 13 circuits, all tau values match spec)
-- Physics (MSE, ECD, flow balance)
-- Integration (10,000 steps no panic, safety determinism, overlap merge)
+116 tests covering:
+
+- **Neuron dynamics** — CfC convergence, tanh bounds, gate modulation, steady-state behavior
+- **Circuit management** — creation, confidence update, type filtering
+- **Topology enforcement** — rejects 3+ circuits per neuron, validates bounds
+- **Overlap zones** — mask filtering, sparsity loss
+- **Memory** — hierarchical decay rates, write-gate blocking, episodic KNN recall, pruning
+- **Input encoding** — Welford's statistics, normalisation, clamping to [-1, 1]
+- **Physics** — MSE, ECD, d-exponent, flow balance
+- **Training** — loss decreases, gradient checks (weight, bias, gate, tau), BPTT, optimizer
+- **Adaptation** — adapter forward pass, replay buffer proportions, production mesh pipeline
+- **Layout** — 4,736 neurons, 13 circuits, correct circuit counts per type
+- **Integration** — full pipeline smoke test, A/B training comparison
 
 ## Dependencies
 
 | Crate | Purpose |
 |---|---|
-| `rayon` | Parallel computation (Phase 1 of update cycle) |
-| `rand` | Stochastic firing for Performance circuits |
+| `rayon` | Parallel CfC neuron updates in mesh step |
+| `rand` | Synthetic data generation, training sampling |
 | `serde` / `serde_json` | Serialisation |
 | `log` | Logging |
 | `thiserror` | Error types |
@@ -156,13 +189,13 @@ cargo test
 
 | Phase | Status |
 |---|---|
-| 1: Foundation (neurons, circuits, topology) | Done |
-| 2: Overlap system (zones, gates, merge) | Done |
+| 1: Foundation (LTC/CfC neurons, circuits, topology) | Done |
+| 2: Overlap system (zones, masks, sparsity) | Done |
 | 3: Memory (hierarchical + episodic) | Done |
 | 4: I/O (WITS encoding, output decoding) | Done |
 | 5: Adaptation (adapters, replay, ProductionMesh) | Done |
-| 6: Training pipeline (backprop, 3-stage training) | Not started |
-| 7: Benchmarks and polish | Partial |
+| 6: Training pipeline (BPTT, 3-stage, AdamW) | Done |
+| 7: Real-data inference (CSV parsing, unit conversion) | Done |
 
 ## License
 

@@ -114,6 +114,57 @@ impl AdapterLayer {
         }
     }
 
+    /// Forward pass operating on a single neuron array.
+    ///
+    /// Used when input_from and output_to indices refer to the same neuron
+    /// array (e.g., the universal mesh during production inference).
+    pub fn forward_in_place(&mut self, neurons: &mut [LtcNeuron]) {
+        // Gather inputs first (before any writes).
+        let inputs: Vec<f32> = self
+            .input_from
+            .iter()
+            .map(|&idx| {
+                if idx < neurons.len() {
+                    neurons[idx].x
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+
+        // Compute adapter neuron activations.
+        for adapter_neuron in &mut self.neurons {
+            let sum: f32 = adapter_neuron
+                .weights_in
+                .iter()
+                .zip(&inputs)
+                .map(|(w, x)| w * x)
+                .sum::<f32>()
+                + adapter_neuron.bias;
+
+            adapter_neuron.x = sum.tanh();
+        }
+
+        // Write adapter outputs to target neurons.
+        for (out_idx_pos, &out_idx) in self.output_to.iter().enumerate() {
+            if out_idx < neurons.len() {
+                let sum: f32 = self
+                    .neurons
+                    .iter()
+                    .map(|an| {
+                        if out_idx_pos < an.weights_out.len() {
+                            an.x * an.weights_out[out_idx_pos]
+                        } else {
+                            0.0
+                        }
+                    })
+                    .sum();
+
+                neurons[out_idx].x += sum;
+            }
+        }
+    }
+
     /// Placeholder for gradient-free training step.
     pub fn train_step(
         &mut self,

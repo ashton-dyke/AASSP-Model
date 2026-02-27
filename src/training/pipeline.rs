@@ -8,7 +8,9 @@ use crate::io::encoding::{encode_input, Baselines};
 use crate::mesh::OverlappingMesh;
 use crate::neuron::cfc_forward;
 use crate::training::backward::backprop_through_time;
-use crate::training::data::{causation_labels_for_sample, detection_labels_for_sample};
+use crate::training::data::{
+    causation_labels_for_sample, detection_labels_for_sample, prediction_labels_for_sample,
+};
 use crate::training::init::initialize_connections;
 use crate::training::loss;
 use crate::training::optimizer::{cosine_lr, AdamOptimizer};
@@ -144,6 +146,7 @@ pub struct TrainingMetrics {
 /// recording CfcIntermediate state for BPTT.
 ///
 /// All neurons update synchronously at every step (no firing logic).
+/// Clamped neurons (input neurons) skip CfC and retain their values.
 pub fn recorded_forward_pass(
     mesh: &mut OverlappingMesh,
     record: &mut ForwardRecord,
@@ -155,11 +158,33 @@ pub fn recorded_forward_pass(
         record.begin_step();
 
         // Phase 1: Compute all new states and record intermediates.
+        // Clamped neurons retain their values and record identity intermediates.
         let mut new_states = Vec::with_capacity(mesh.neurons.len());
         for neuron_idx in 0..mesh.neurons.len() {
-            let (x_new, inter) = cfc_forward(&mesh.neurons[neuron_idx], &mesh.neurons, dt);
-            record.record_neuron(neuron_idx, inter);
-            new_states.push(x_new);
+            let is_clamped = neuron_idx < mesh.clamped_neurons.len()
+                && mesh.clamped_neurons[neuron_idx];
+
+            if is_clamped {
+                // Identity intermediate: x_new = x_prev, no dynamics.
+                let x = mesh.neurons[neuron_idx].x;
+                let inter = crate::neuron::CfcIntermediate {
+                    x_prev: x,
+                    f: 0.0,
+                    a: 0.0,
+                    alpha: 1.0,
+                    exp_term: 1.0,
+                    drive_sum: 0.0,
+                    gate_sum: 0.0,
+                    tau: mesh.neurons[neuron_idx].tau,
+                };
+                record.record_neuron(neuron_idx, inter);
+                new_states.push(x);
+            } else {
+                let (x_new, inter) =
+                    cfc_forward(&mesh.neurons[neuron_idx], &mesh.neurons, dt);
+                record.record_neuron(neuron_idx, inter);
+                new_states.push(x_new);
+            }
         }
 
         // Phase 2: Apply new states atomically.
@@ -435,9 +460,12 @@ fn train_circuit_group(
             let caus_labels = causation_labels_for_sample(seq, sample_idx);
             let (caus_loss, caus_dl_dx) = loss::causation_loss(mesh, &caus_labels);
 
+            let pred_labels = prediction_labels_for_sample(seq, sample_idx, baselines);
+            let (_pred_loss, pred_dl_dx) = loss::prediction_loss(mesh, &pred_labels);
+
             let mut dl_dx_output = vec![0.0f32; mesh.neurons.len()];
             for i in 0..dl_dx_output.len() {
-                dl_dx_output[i] = det_dl_dx[i] + caus_dl_dx[i];
+                dl_dx_output[i] = det_dl_dx[i] + caus_dl_dx[i] + pred_dl_dx[i];
             }
 
             let mut grads = GradientAccumulator::from_mesh(mesh);
@@ -510,9 +538,12 @@ fn run_stage3(
             let caus_labels = causation_labels_for_sample(seq, sample_idx);
             let (_, caus_dl_dx) = loss::causation_loss(mesh, &caus_labels);
 
+            let pred_labels = prediction_labels_for_sample(seq, sample_idx, baselines);
+            let (_, pred_dl_dx) = loss::prediction_loss(mesh, &pred_labels);
+
             let mut dl_dx_output = vec![0.0f32; mesh.neurons.len()];
             for i in 0..dl_dx_output.len() {
-                dl_dx_output[i] = det_dl_dx[i] + caus_dl_dx[i];
+                dl_dx_output[i] = det_dl_dx[i] + caus_dl_dx[i] + pred_dl_dx[i];
             }
 
             let mut grads = GradientAccumulator::from_mesh(mesh);
@@ -760,7 +791,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
         let mut losses = Vec::new();
 
-        for _step in 0..100 {
+        for _step in 0..150 {
             let seq_idx = rand::Rng::gen_range(&mut rng, 0..dataset.len());
             let seq = &dataset[seq_idx];
             let sample_idx = rand::Rng::gen_range(&mut rng, 0..seq.wits_samples.len());
@@ -787,9 +818,10 @@ mod tests {
             "All losses should be finite"
         );
 
-        // Loss should decrease: compare first 10 vs last 10 steps.
-        let early_avg: f32 = losses[..10].iter().sum::<f32>() / 10.0;
-        let late_avg: f32 = losses[90..].iter().sum::<f32>() / 10.0;
+        // Loss should decrease: compare first 20 vs last 20 steps (wider window
+        // for stability with positive-class-weighted BCE).
+        let early_avg: f32 = losses[..20].iter().sum::<f32>() / 20.0;
+        let late_avg: f32 = losses[130..].iter().sum::<f32>() / 20.0;
         assert!(
             late_avg < early_avg,
             "Detection loss should decrease: early_avg={early_avg:.4}, late_avg={late_avg:.4}"

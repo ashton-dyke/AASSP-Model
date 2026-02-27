@@ -155,10 +155,11 @@ impl EpisodicMemory {
         }
     }
 
-    /// Find k most similar past episodes to the current neuron state.
+    /// Find k most similar past episodes to the current neuron state,
+    /// returning each episode with its similarity score.
     ///
     /// Uses cosine similarity on the dense state vectors.
-    pub fn recall_similar(&self, neurons: &[LtcNeuron], k: usize) -> Vec<&Episode> {
+    pub fn recall_similar_scored(&self, neurons: &[LtcNeuron], k: usize) -> Vec<(&Episode, f32)> {
         if self.episodes.is_empty() || k == 0 {
             return Vec::new();
         }
@@ -190,7 +191,17 @@ impl EpisodicMemory {
         scored
             .iter()
             .take(k)
-            .filter_map(|&(idx, _)| self.episodes.get(idx))
+            .filter_map(|&(idx, sim)| self.episodes.get(idx).map(|ep| (ep, sim)))
+            .collect()
+    }
+
+    /// Find k most similar past episodes to the current neuron state.
+    ///
+    /// Uses cosine similarity on the dense state vectors.
+    pub fn recall_similar(&self, neurons: &[LtcNeuron], k: usize) -> Vec<&Episode> {
+        self.recall_similar_scored(neurons, k)
+            .into_iter()
+            .map(|(ep, _)| ep)
             .collect()
     }
 

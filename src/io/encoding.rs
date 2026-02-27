@@ -156,6 +156,9 @@ pub fn normalise(value: f32, baseline: &BaselineStats) -> f32 {
 }
 
 /// Encode a WITS snapshot into detection circuit input neurons.
+///
+/// Sets the first 14 neurons of each detection circuit to the normalised
+/// input values and marks them as clamped so they persist during stepping.
 pub fn encode_input(mesh: &mut OverlappingMesh, wits: &WitsSnapshot, baselines: &Baselines) {
     let features = wits.as_feature_array();
     let baseline_arr = baselines.as_array();
@@ -166,12 +169,22 @@ pub fn encode_input(mesh: &mut OverlappingMesh, wits: &WitsSnapshot, baselines: 
         .map(|(&val, bl)| normalise(val, bl))
         .collect();
 
-    // Write to input neurons (first 14 neurons of each detection circuit).
+    // Clear previous clamp state.
+    for c in &mut mesh.clamped_neurons {
+        *c = false;
+    }
+
+    // Write to input neurons (first 14 neurons of each detection circuit)
+    // and mark them as clamped.
     for circuit in &mesh.circuits {
         if circuit.circuit_type == CircuitType::Detection {
             for (i, &value) in encoded.iter().enumerate() {
                 if i < circuit.neuron_indices.len() {
-                    mesh.neurons[circuit.neuron_indices[i]].x = value;
+                    let idx = circuit.neuron_indices[i];
+                    mesh.neurons[idx].x = value;
+                    if idx < mesh.clamped_neurons.len() {
+                        mesh.clamped_neurons[idx] = true;
+                    }
                 }
             }
         }

@@ -8,6 +8,7 @@ use crate::config::MeshConfig;
 use crate::neuron::{cfc_forward_inference, LtcNeuron};
 use crate::overlap::OverlapZone;
 use crate::topology::{TopologyConstraint, TopologyError};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// The central neural mesh structure.
@@ -30,14 +31,19 @@ pub struct OverlappingMesh {
 
     /// Current simulation tick.
     pub tick: u64,
+
+    /// Input-clamped neurons: these neurons skip CfC forward and
+    /// retain their externally set values during stepping.
+    /// Set by `encode_input`, cleared by `reset_activations`.
+    #[serde(skip)]
+    pub clamped_neurons: Vec<bool>,
 }
 
 impl OverlappingMesh {
     /// Create a new mesh with the given config.
     pub fn new(config: MeshConfig) -> Self {
-        let neurons = (0..config.total_neurons)
-            .map(|_| LtcNeuron::new())
-            .collect();
+        let n = config.total_neurons;
+        let neurons = (0..n).map(|_| LtcNeuron::new()).collect();
 
         Self {
             neurons,
@@ -46,6 +52,7 @@ impl OverlappingMesh {
             topology: TopologyConstraint::new(),
             config,
             tick: 0,
+            clamped_neurons: vec![false; n],
         }
     }
 
@@ -70,14 +77,25 @@ impl OverlappingMesh {
     /// Run one synchronous CfC step.
     ///
     /// 1. Compute all new neuron states from the current state (CfC closed-form).
+    ///    Clamped neurons (input neurons) skip CfC and retain their values.
     /// 2. Apply new states atomically.
     /// 3. Update circuit confidences.
     pub fn step(&mut self) {
         let dt = self.config.dt;
 
-        // Phase 1: compute all new states from current state.
-        let new_states: Vec<f32> = (0..self.neurons.len())
-            .map(|i| cfc_forward_inference(&self.neurons[i], &self.neurons, dt))
+        // Phase 1: compute all new states from current state (parallel).
+        // Clamped neurons retain their externally set values.
+        let neurons = &self.neurons;
+        let clamped = &self.clamped_neurons;
+        let new_states: Vec<f32> = (0..neurons.len())
+            .into_par_iter()
+            .map(|i| {
+                if i < clamped.len() && clamped[i] {
+                    neurons[i].x // Keep clamped value.
+                } else {
+                    cfc_forward_inference(&neurons[i], neurons, dt)
+                }
+            })
             .collect();
 
         // Phase 2: apply atomically.
@@ -107,6 +125,9 @@ impl OverlappingMesh {
     pub fn reset_activations(&mut self) {
         for neuron in &mut self.neurons {
             neuron.x = 0.0;
+        }
+        for c in &mut self.clamped_neurons {
+            *c = false;
         }
         self.tick = 0;
     }

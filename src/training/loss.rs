@@ -11,7 +11,17 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
-/// Get the readout value for a detection circuit: sigmoid of mean of last N neurons.
+/// Compute the readout gain for a circuit based on its tau.
+///
+/// CfC dynamics with time constant tau produce a maximum steady-state
+/// activation of `f/alpha ≈ 0.5 / (1/tau + 0.5)`. This gain factor
+/// rescales the readout so that sigmoid spans a useful range.
+pub fn readout_gain(tau: f32) -> f32 {
+    let alpha = 1.0 / tau.max(1e-6) + 0.5;
+    2.0 * alpha
+}
+
+/// Get the readout value for a detection circuit: sigmoid of scaled mean of last N neurons.
 pub fn detection_readout(mesh: &OverlappingMesh, circuit_idx: usize) -> f32 {
     let circuit = &mesh.circuits[circuit_idx];
     let indices = &circuit.neuron_indices;
@@ -28,7 +38,8 @@ pub fn detection_readout(mesh: &OverlappingMesh, circuit_idx: usize) -> f32 {
         .sum::<f32>()
         / readout_indices.len() as f32;
 
-    sigmoid(mean)
+    let gain = readout_gain(circuit.tau);
+    sigmoid(mean * gain)
 }
 
 /// Binary cross-entropy loss for a single detection circuit.
@@ -45,6 +56,14 @@ pub fn binary_cross_entropy_grad(y_pred: f32, y_true: f32) -> f32 {
     let p = y_pred.clamp(EPS, 1.0 - EPS);
     -(y_true / p) + (1.0 - y_true) / (1.0 - p)
 }
+
+/// Positive-class weight for detection loss.
+///
+/// Anomaly samples (y_true=1) get this multiplier on their loss and gradient.
+/// This prevents the optimizer from finding a degenerate "suppress everything"
+/// solution where all readouts stay below 0.5 — since missing an anomaly now
+/// costs 3x more than a false alarm on normal data.
+const POSITIVE_CLASS_WEIGHT: f32 = 3.0;
 
 /// Compute total detection loss across all detection circuits.
 ///
@@ -67,14 +86,21 @@ pub fn detection_loss(
         }
 
         let y_pred = detection_readout(mesh, circuit_idx);
-        total_loss += binary_cross_entropy(y_pred, y_true);
+
+        // Apply positive-class weighting: missing an anomaly costs more.
+        let class_weight = if y_true > 0.5 { POSITIVE_CLASS_WEIGHT } else { 1.0 };
+
+        total_loss += class_weight * binary_cross_entropy(y_pred, y_true);
 
         // ∂L/∂y_pred
-        let dl_dy = binary_cross_entropy_grad(y_pred, y_true);
+        let dl_dy = class_weight * binary_cross_entropy_grad(y_pred, y_true);
 
-        // ∂y_pred/∂mean = sigmoid'(mean) = y_pred * (1 - y_pred)
+        // ∂y_pred/∂(mean*gain) = sigmoid'(mean*gain) = y_pred * (1 - y_pred)
+        // ∂(mean*gain)/∂mean = gain
+        // ∂y_pred/∂mean = y_pred * (1 - y_pred) * gain
+        let gain = readout_gain(circuit.tau);
         let sigmoid_deriv = y_pred * (1.0 - y_pred);
-        let dl_d_mean = dl_dy * sigmoid_deriv;
+        let dl_d_mean = dl_dy * sigmoid_deriv * gain;
 
         // ∂mean/∂x_i = 1/N for each readout neuron
         let indices = &circuit.neuron_indices;
@@ -116,17 +142,19 @@ pub fn causation_loss(
         let start = if n > READOUT_NEURONS { n - READOUT_NEURONS } else { 0 };
         let readout_indices = &indices[start..];
 
+        let gain = readout_gain(circuit.tau);
+
         for &(pos, y_true) in param_labels {
             if pos >= readout_indices.len() {
                 continue;
             }
             let neuron_idx = readout_indices[pos];
-            let y_pred = sigmoid(mesh.neurons[neuron_idx].x);
+            let y_pred = sigmoid(mesh.neurons[neuron_idx].x * gain);
             total_loss += binary_cross_entropy(y_pred, y_true);
 
             let dl_dy = binary_cross_entropy_grad(y_pred, y_true);
             let sigmoid_deriv = y_pred * (1.0 - y_pred);
-            dl_dx[neuron_idx] += dl_dy * sigmoid_deriv;
+            dl_dx[neuron_idx] += dl_dy * sigmoid_deriv * gain;
         }
     }
 

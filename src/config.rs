@@ -49,7 +49,7 @@ impl Default for MeshConfig {
         Self {
             total_neurons: 4_736,
             reserved_neurons: 3_456,
-            dt: 0.001,
+            dt: 0.005,
             mesh_steps_per_wits_sample: 100,
             overlap_prune_threshold: 0.1,
             safety_override_threshold: 0.75,
